@@ -1,7 +1,7 @@
 // Measures of students' speaking (transcripts) and writing, for the Progress page of the Teacher's Edition
 // and for the CSV export used in research. Everything is computed in the teacher's browser.
-import { tokens, lemma, vocabProfile } from "./writing.js?v=20261029a";
-import { parseSpeakMeta, exercisesOf } from "./common.js?v=20261029a";
+import { tokens, lemma, vocabProfile } from "./writing.js?v=20261029b";
+import { parseSpeakMeta, exercisesOf } from "./common.js?v=20261029b";
 
 // Which answers are followed over time:
 //  speaking – every "open" item with "speak" (recorded and turned into text);

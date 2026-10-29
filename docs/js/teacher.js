@@ -4,17 +4,17 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
   doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, orderBy,
   writeBatch, arrayUnion, arrayRemove, serverTimestamp, deleteField,
-} from "./fb.js?v=20261029a";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261029a";
+} from "./fb.js?v=20261029b";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261029b";
 import {
   esc, renderBlocks, renderExercise, exercisesOf, isAuto, gradeAuto, buildResult, keyText, norm,
   fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, KIND_LABEL, isTeacherChecked, gradeExercise, wireFlashcards, isManual,
-  isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2,
-} from "./common.js?v=20261029a";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029a";
-import { loadVocab, grammarCheck, vocabProfile, unitVocabulary, feedbackHTML, sleep } from "./writing.js?v=20261029a";
-import "./speaking.js?v=20261029a";
-import { trackedTasks, measure, METRICS, toCSV } from "./progress.js?v=20261029a";
+  isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2, hashStr,
+} from "./common.js?v=20261029b";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029b";
+import { loadVocab, grammarCheck, vocabProfile, unitVocabulary, feedbackHTML, sleep } from "./writing.js?v=20261029b";
+import "./speaking.js?v=20261029b";
+import { trackedTasks, measure, METRICS, toCSV } from "./progress.js?v=20261029b";
 
 const $ = (s) => document.querySelector(s);
 const ls = {
@@ -37,6 +37,18 @@ const T = {
   journal: undefined,    // attendance of the current group: {lessons: {"2026-10-21": {absent: [uid]}}}
   unitViewKey: "",
 };
+// Whose answers are shown in the exercise fields of a unit page (per group, remembered in this browser):
+// "me" = the teacher's own practice answers; a student's uid = that student's answers as sent with Done;
+// nothing chosen = the only student of the group (individual lessons), otherwise the teacher's own answers.
+const viewAsKey = () => "viewAs:" + T.gid;
+function viewedStudent() {
+  const v = ls.get(viewAsKey(), "");
+  if (v === "me") return null;
+  const st = T.students.find((s) => s.uid === v) || (T.students.length === 1 ? T.students[0] : null);
+  return st || null;
+}
+const mediaBusy = () => [...document.querySelectorAll("#view audio, #view video")].some((m) => !m.paused && !m.ended)
+  || !!document.querySelector("#view .spk.run, #view .spk-live:not([hidden])");
 // An absent student gets this share of the points for the in-class exercises of that lesson
 const ABSENT_FACTOR = 0.25;
 
@@ -209,6 +221,12 @@ function render(force = false) {
   // only the live statistics are refreshed. The teacher's own answers, an audio file that is playing,
   // a flashcard or a recorder stay as they are.
   if (!force && r.unit && r.unit === T.unitId && T.unitViewKey && T.unitViewKey === unitViewKey(r)) { patchUnitStats(); return; }
+  // new answers from the student while audio or a recording is playing in class: wait until it stops
+  if (!force && r.unit && r.unit === T.unitId && T.unitViewKey && mediaBusy()) {
+    patchUnitStats();
+    clearTimeout(T.waitT); T.waitT = setTimeout(() => render(), 3000);
+    return;
+  }
   // do not re-render while the teacher is typing a mark, comment or JSON
   const a = document.activeElement;
   if (!force && a && $("#view").contains(a) && a.matches(".g-score,.g-comment,textarea.json,input[type=text],input:not([type]),[data-item],input[type=date]")) return;
@@ -246,15 +264,26 @@ function viewUnit(r) {
   for (const note of [...(d.notes[sec.id] || [])].reverse()) blocks.splice(note.at, 0, { type: "teacher-note", html: note.html });
   const prev = secs[i - 1], next = secs[i + 1];
   const mine = T.practice[u.id] || {};
+  const vs = viewedStudent();
+  const vsub = vs ? T.subs.find((s) => s.uid === vs.uid) : null;
+  const vdone = vsub ? doneMap(vsub.answers) : {};
+  const vfb = vs ? T.exr?.[vs.uid]?.feedback || {} : {};
   return bar + docxBar(u) + pageHead(`Unit ${n} &middot; ${n}.${i + 1}`, esc(sec.title), esc(meta.subtitle || sec.subtitle || ""))
-    + `<p class="muted tip">You can type and choose answers here, as the students do: nothing is saved or sent to the students.
-       Under each exercise title you can mark it <b>In-Class</b> or <b>HA</b> and tick <b>Done</b>. The figures on the right update live while the students work (drafts included).
-       ${Object.keys(mine).length ? `<button class="btn small" data-act="practice-clear" data-unit="${esc(u.id)}">Clear my answers</button>` : ""}</p>`
+    + viewAsBar(vs, vsub)
+    + (vs ? "" : `<p class="muted tip">You can type and choose answers here, as the students do: nothing is saved or sent to the students.
+       Under each exercise title you can mark it <b>In-Class</b> or <b>HA</b> and tick <b>Done</b>. The figures on the right update live while the students work.
+       ${Object.keys(mine).length ? `<button class="btn small" data-act="practice-clear" data-unit="${esc(u.id)}">Clear my answers</button>` : ""}</p>`)
     + renderBlocks(blocks, (ex) => {
       const st = exStats(ex);
+      const sent = vsub && (vdone[ex.id] || vsub.status === "submitted");
+      const sAns = vsub?.answers?.[ex.id] || {};
       return {
-        key: d.keys[ex.id] || {}, readOnly: false,
-        answers: mine[ex.id] || {},
+        // when the learner's Done exercise is marked, "Correct: …" already shows the key for wrong answers
+        key: vs && sent && isAuto(ex) ? {} : d.keys[ex.id] || {}, readOnly: !!vs,
+        answers: vs ? sAns : mine[ex.id] || {},
+        auto: vs && sent && isAuto(ex) ? gradeExercise(ex, sAns, d.keys[ex.id] || {}).items : undefined,
+        headExtra: vs ? studentPill(ex, vsub, sent) : "",
+        itemExtra: vs && vfb[ex.id] ? (itemId) => feedbackHTML(vfb[ex.id][itemId], { checkedAt: fmtTime(T.exr[vs.uid].feedbackAt?.[ex.id]) }) : null,
         tag: ex.check === "teacher" ? (isManual(ex) ? "Writing check by the teacher" : "Checked by the teacher") : "",
         before: g ? toolsBar(u, ex, g, st) : "",
         itemStat: st.items ? (itemId) => `<span class="istat" data-is="${esc(ex.id)}|${esc(itemId)}">${itemBadge(ex, st.items[itemId])}</span>` : null,
@@ -266,6 +295,27 @@ function viewUnit(r) {
       ${next ? `<a class="pg next" href="#${u.id}/${next.id}"><span class="d">Next</span><span class="t">${n}.${i + 2} ${esc(next.title)}</span></a>` : ""}
     </nav>`;
 }
+
+// Choice of whose answers fill the exercises on a unit page
+function viewAsBar(vs, vsub) {
+  if (!T.gid || !T.students.length) return "";
+  const cur = vs ? vs.uid : "me";
+  const opts = T.students.map((s) => `<option value="${esc(s.uid)}" ${cur === s.uid ? "selected" : ""}>${esc(s.name)} (student)</option>`).join("")
+    + `<option value="me" ${cur === "me" ? "selected" : ""}>My own answers (practice)</option>`;
+  const info = !vs ? "" : !vsub ? `<span class="muted">${esc(vs.name)} has not sent anything in this unit yet.</span>`
+    : `<span class="muted">Answers appear here when ${esc(vs.name)} clicks <b>Done</b>${vsub.updatedAt ? ` · last sent ${esc(fmtTime(vsub.updatedAt))}` : ""}. Fields are read-only; auto-checked exercises are marked when they are Done.</span>`;
+  return `<div class="viewas"><label>Answers in the exercises <select data-viewas>${opts}</select></label> ${info}</div>`;
+}
+function studentPill(ex, vsub, sent) {
+  if (!vsub) return `<span class="sp-pill off">not sent</span>`;
+  if (!sent) return `<span class="sp-pill off">not Done yet</span>`;
+  return `<span class="sp-pill on">Done</span>`;
+}
+document.addEventListener("change", (e) => {
+  if (!e.target.matches?.("[data-viewas]")) return;
+  ls.set(viewAsKey(), e.target.value);
+  render(true);
+});
 
 // Download the whole unit as a Word file (no interactive elements): Student's Book or Teacher's Book with keys
 function docxBar(u) {
@@ -281,7 +331,7 @@ async function downloadDocx(unitId, ver, btn) {
   try {
     const d = await loadUnitData(unitId);
     if (!d?.content) throw new Error("This unit has no content yet.");
-    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261029a");
+    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261029b");
     const teacher = ver === "teacher";
     const sections = d.content.sections.map((s) => ({ ...s, subtitle: (u.sections || []).find((m) => m.id === s.id)?.subtitle || s.subtitle || "" }));
     const blob = await exportUnitDocx({ courseTitle: COURSE_TITLE, unitNum: unitNum(u), unitTitle: u.title, sections,
@@ -376,7 +426,16 @@ function unitViewKey(r) {
   const u = T.units.find((x) => x.id === r.unit), g = group(), d = T.unitData[r.unit];
   if (!u || !d?.content) return "";
   return JSON.stringify([u.id, r.section || "", T.gid, u.status, !!g?.openUnits?.includes(u.id), !!g?.releasedUnits?.includes(u.id),
-    g?.releasedEx?.[u.id] || [], g?.feedbackEx?.[u.id] || [], g?.plan?.[u.id] || {}, Object.keys(T.practice[u.id] || {}).length > 0]);
+    g?.releasedEx?.[u.id] || [], g?.feedbackEx?.[u.id] || [], g?.plan?.[u.id] || {}, Object.keys(T.practice[u.id] || {}).length > 0,
+    viewedKey()]);
+}
+// the viewed student's sent answers and writing feedback: the page is drawn again when they change
+function viewedKey() {
+  const vs = viewedStudent();
+  if (!vs) return "me";
+  const sub = T.subs.find((s) => s.uid === vs.uid);
+  const fb = T.exr?.[vs.uid]?.feedbackAt || {};
+  return vs.uid + "|" + (sub ? hashStr(JSON.stringify([sub.answers || {}, sub.status || ""])) : "-") + "|" + hashStr(JSON.stringify(fb));
 }
 function patchUnitStats() {
   const d = T.unitData[T.unitId];

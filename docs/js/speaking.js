@@ -1,7 +1,7 @@
 // Speaking: timers with an in-browser voice recorder (from the msupm2 course engine).
 // The recording never leaves the browser: it is kept in memory as a blob, played back here and,
 // if the student wants, saved to their own computer with "Download". Reloading the page clears it.
-import { registerSpeaking, esc } from "./common.js?v=20261029a";
+import { registerSpeaking, esc } from "./common.js?v=20261029b";
 
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const SPK = new Map();   // key -> state (survives re-rendering of the page)
@@ -92,7 +92,7 @@ function startTranscript(tr, blob, dur, take) {
   setTrs(tr, "Your recording is waiting to be turned into text…", false, true);
   trQueue = trQueue.then(async () => {
     try {
-      const { transcribe, ASR_MODEL_NAME } = await import("./transcribe.js?v=20261029a");
+      const { transcribe, ASR_MODEL_NAME } = await import("./transcribe.js?v=20261029b");
       const { text } = await transcribe(blob, (m) => setTrs(tr, m, false, true));
       const [ex, item] = tr.split("|");
       if (!text) { setTrs(tr, "No words were recognised. Check the microphone, speak a little closer and record again.", true); return; }
