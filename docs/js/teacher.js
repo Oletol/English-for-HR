@@ -4,17 +4,17 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
   doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, orderBy,
   writeBatch, arrayUnion, arrayRemove, serverTimestamp, deleteField,
-} from "./fb.js?v=20261029b";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261029b";
+} from "./fb.js?v=20261029c";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261029c";
 import {
   esc, renderBlocks, renderExercise, exercisesOf, isAuto, gradeAuto, buildResult, keyText, norm,
   fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, KIND_LABEL, isTeacherChecked, gradeExercise, wireFlashcards, isManual,
   isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2, hashStr,
-} from "./common.js?v=20261029b";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029b";
-import { loadVocab, grammarCheck, vocabProfile, unitVocabulary, feedbackHTML, sleep } from "./writing.js?v=20261029b";
-import "./speaking.js?v=20261029b";
-import { trackedTasks, measure, METRICS, toCSV } from "./progress.js?v=20261029b";
+} from "./common.js?v=20261029c";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029c";
+import { loadVocab, grammarCheck, vocabProfile, unitVocabulary, feedbackHTML, sleep } from "./writing.js?v=20261029c";
+import "./speaking.js?v=20261029c";
+import { trackedTasks, measure, METRICS, toCSV } from "./progress.js?v=20261029c";
 
 const $ = (s) => document.querySelector(s);
 const ls = {
@@ -285,7 +285,7 @@ function viewUnit(r) {
         headExtra: vs ? studentPill(ex, vsub, sent) : "",
         itemExtra: vs && vfb[ex.id] ? (itemId) => feedbackHTML(vfb[ex.id][itemId], { checkedAt: fmtTime(T.exr[vs.uid].feedbackAt?.[ex.id]) }) : null,
         tag: ex.check === "teacher" ? (isManual(ex) ? "Writing check by the teacher" : "Checked by the teacher") : "",
-        before: g ? toolsBar(u, ex, g, st) : "",
+        before: g ? toolsBar(u, ex, g, st) : NO_GROUP_BAR,
         itemStat: st.items ? (itemId) => `<span class="istat" data-is="${esc(ex.id)}|${esc(itemId)}">${itemBadge(ex, st.items[itemId])}</span>` : null,
         after: st.items ? `<div class="mist" data-mi="${esc(ex.id)}" ${T.mistOpen.has(ex.id) ? "" : "hidden"}>${mistakesHTML(ex, st)}</div>` : "",
       };
@@ -331,7 +331,7 @@ async function downloadDocx(unitId, ver, btn) {
   try {
     const d = await loadUnitData(unitId);
     if (!d?.content) throw new Error("This unit has no content yet.");
-    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261029b");
+    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261029c");
     const teacher = ver === "teacher";
     const sections = d.content.sections.map((s) => ({ ...s, subtitle: (u.sections || []).find((m) => m.id === s.id)?.subtitle || s.subtitle || "" }));
     const blob = await exportUnitDocx({ courseTitle: COURSE_TITLE, unitNum: unitNum(u), unitTitle: u.title, sections,
@@ -372,6 +372,12 @@ function toolsBar(u, ex, g, st) {
   const check = ex.check === "teacher" ? (isManual(ex) ? writingBar(u, ex, g) : exerciseBar(u, ex, g)) : "";
   return `<div class="ex-bar tbar">${row}${check}</div>`;
 }
+
+// Without a group In-Class / HA and Done cannot be stored (they are kept per group): show them switched off with a hint
+const NO_GROUP_BAR = `<div class="ex-bar tbar"><div class="tb-row">
+  <span class="seg" role="group" aria-label="Type of work"><button type="button" disabled>In-Class</button><button type="button" disabled>HA</button></span>
+  <label class="tb-done"><input type="checkbox" disabled> Done</label>
+  <span class="muted" style="font-size:12.5px">Create a group in <a href="#tools/groups">Groups &amp; students</a> to mark In-Class / HA and the date</span></div></div>`;
 
 // students of the group and their answers in this exercise (drafts and submitted work)
 function exStats(ex) {

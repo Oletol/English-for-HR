@@ -51,6 +51,12 @@ const db = await t.evaluate(() => JSON.parse(localStorage.getItem("mock:db")));
 const pub = JSON.stringify(db["unitContent/u1"]);
 for (const bad of ['"answer":', "Key:", "Model answer", "Bertrand, M.", "Suggested marking"]) assert.ok(!pub.includes(bad), "public content contains " + bad);
 
+step("Without a group: In-Class / HA shown switched off");
+await t.click('.sb-uh[data-unit="u1"]').catch(() => {});
+await t.click('.sb-item[href$="u1/warmup"]');
+await t.waitForSelector("#view .tbar .seg button[disabled]");
+await t.locator("#view .tbar").first().screenshot({ path: `${SHOTS}/t-nogroup-bar.png` });
+
 step("Group, one learner, unit opened");
 await t.click('a[href="#tools/groups"]');
 await t.waitForSelector("#g-name");
@@ -136,6 +142,46 @@ for (const id of ["w2", "w3", "w4", "w5", "w7"]) await s.locator(`#ex-${id}`).sc
 await t.waitForSelector("#view .tnote");
 await shot(t, "t-warmup", true);
 await shot(s, "s-warmup-checked", true);
+
+step("Translation exercises w8, w9");
+await s.fill(sel("w8", "1"), "a diverse team");
+await s.fill(sel("w8", "4"), "have equal possibilities");
+await s.fill(sel("w9", "2"), "report to");
+await s.click('[data-done="w8"]');
+await s.click('[data-done="w9"]');
+await t.waitForFunction(() => /^Done$/.test(document.querySelector("#ex-w9 .sp-pill")?.textContent || ""), null, { timeout: 5000 });
+for (const [id, expect] of [["w8", "1 / 8"], ["w9", "1 / 8"]]) {
+  await t.click(`[data-act="check-ex"][data-ex="${id}"]`);
+  await s.waitForSelector(`#ex-${id} .ex-score`, { timeout: 5000 });
+  assert.equal((await s.textContent(`#ex-${id} .ex-score`)).trim(), expect, id);
+  await s.locator(`#ex-${id}`).screenshot({ path: `${SHOTS}/c-${id}.png` });
+}
+
+step("Reading");
+await s.click('.sb-item[href$="u1/reading"]');
+await s.waitForSelector("#ex-r10");
+const rtext = await s.evaluate(() => document.body.innerText);
+assert.ok(!/Key:|Teaching notes|Model answer|Suggested marking/.test(rtext), "key visible in reading");
+assert.ok(!/[\u2190\u2192\u21d2\u00ab\u00bb\u203a\u25b6]/.test(rtext), "arrow in reading");
+await shot(s, "s-reading", true);
+for (const it of ex("r1").items) await s.selectOption(sel("r1", it.id), ans("r1", it.id));
+for (const it of ex("r5").items) await s.selectOption(sel("r5", it.id), ans("r5", it.id));
+await s.selectOption(sel("r5", "6"), "False");
+for (const it of ex("r7").items) await s.selectOption(sel("r7", it.id), ans("r7", it.id));
+for (const it of ex("r9").items) await s.fill(sel("r9", it.id), ans("r9", it.id));
+await s.fill(sel("r9", "8"), "unhonest");
+await s.fill(sel("r8", "1"), "Because nobody believes it.");
+for (const id of ["r1", "r5", "r7", "r9", "r8"]) await s.click(`[data-done="${id}"]`);
+await t.click('.sb-item[href$="u1/reading"]');
+await t.waitForFunction(() => /^Done$/.test(document.querySelector("#ex-r8 .sp-pill")?.textContent || ""), null, { timeout: 5000 });
+assert.equal(await t.inputValue(sel("r8", "1")), "Because nobody believes it.");
+for (const [id, expect] of [["r1", "8 / 8"], ["r5", "9 / 10"], ["r7", "5 / 5"], ["r9", "7 / 8"]]) {
+  await t.click(`[data-act="check-ex"][data-ex="${id}"]`);
+  await s.waitForSelector(`#ex-${id} .ex-score`, { timeout: 5000 });
+  assert.equal((await s.textContent(`#ex-${id} .ex-score`)).trim(), expect, id);
+  await s.locator(`#ex-${id}`).screenshot({ path: `${SHOTS}/c-${id}.png` });
+}
+await shot(t, "t-reading", true);
 
 assert.deepEqual(errors, [], "page errors");
 console.log("\nALL STEPS PASSED");
