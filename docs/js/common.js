@@ -1,5 +1,6 @@
 // Общие функции: отрисовка упражнений, автопроверка, подсчёт баллов.
 // Используются и студенческой, и преподавательской страницей.
+import { metricsLine } from "./transcribe.js?v=20261111a";
 
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -141,7 +142,7 @@ export function buildResult({ sub, content, keys, manual = {}, showCorrect = tru
   let mScore = 0, mMax = 0, pending = 0;
   for (const ex of exercisesOf(content)) {
     if (!isManual(ex)) continue;
-    for (const it of ex.items || []) {
+    for (const it of (ex.items || []).filter((x) => !x.plain)) {   // "plain": an extra line (a partner's name) that gets no points
       mMax += itemMax(ex, it);
       const g = manual?.[ex.id]?.[it.id];
       if (g && g.score !== null && g.score !== "" && g.score !== undefined) mScore += Number(g.score) * (factors[ex.id] ?? 1);
@@ -275,7 +276,7 @@ export function renderExercise(ex, o = {}) {
       const m = o.manual?.[it.id];
       const max = itemMax(ex, it);
       let grade = "";
-      if (o.grading) {
+      if (o.grading && !it.plain) {
         grade = `<div class="grade-box">
           <label>Score <input type="number" min="0" max="${max}" step="0.5" class="g-score" data-ex="${esc(ex.id)}" data-item="${esc(it.id)}" value="${esc(m?.score ?? "")}"> / ${max}</label>
           <textarea class="g-comment" rows="2" placeholder="Comment for the student" data-ex="${esc(ex.id)}" data-item="${esc(it.id)}">${esc(m?.comment ?? "")}</textarea>
@@ -288,18 +289,13 @@ export function renderExercise(ex, o = {}) {
       const minW = it.minWords || ex.minWords;
       const wc = minW ? `<div class="wc"><span class="wc-n" data-wc="${esc(ex.id)}:${esc(it.id)}">${countWords(val)}</span> words <span class="muted">· at least ${minW}</span></div>` : "";
       const model = o.key && o.key[it.id] ? `<div class="keyhint model"><b>Model answer:</b> ${esc(keyText(o.key[it.id]))}</div>` : "";
-      if (it.speak) {
-        // speaking task: the answer is recorded and turned into text in the browser (speaking.js, transcribe.js);
-        // the text cannot be typed or edited, only recorded again
-        const tr = `${ex.id}|${it.id}`;
-        const meta = parseSpeakMeta(a[it.id + "~m"]);
-        const info = meta.dur ? `<div class="wc"><span class="wc-n" data-wc="${esc(ex.id)}:${esc(it.id)}">${countWords(val)}</span> words · ${fmtSec(meta.dur)} · recording ${esc(meta.take || "1")}${meta.dur && countWords(val) ? ` · ${Math.round(countWords(val) / (meta.dur / 60))} words a minute` : ""}</div>` : "";
-        const rec = o.readOnly ? "" : speakingHTML({ sec: it.speak, tr, label: `Your answer (${fmtSec(it.speak)})` }, "speak-" + tr);
-        body = `${it.text}${model}${rec}<p class="trs" data-trs="${esc(tr)}"></p>
-          <textarea class="open-answer transcript" rows="${it.rows || 4}" readonly ${attrs} ${NOAUTO} placeholder="${o.readOnly ? "" : "Your words will appear here as text after you record your answer."}">${esc(val)}</textarea>
-          <input type="hidden" data-ex="${esc(ex.id)}" data-item="${esc(it.id)}~m" value="${esc(a[it.id + "~m"] ?? "")}" ${dis}>${info}${o.itemExtra ? o.itemExtra(it.id) : ""}${grade}`;
-      } else
-      body = `${it.text}${model}<textarea class="open-answer" rows="${it.rows || 5}" ${attrs} ${NOAUTO} placeholder="${o.readOnly ? "" : "Type your answer here…"}">${esc(val)}</textarea>${wc}${o.itemExtra ? o.itemExtra(it.id) : ""}${grade}`;
+      // "transcript": the text is written by the speech recogniser (speaking block with "transcribe"), not typed
+      const tr = ex.transcript && it === ex.items[0];
+      let spLine = "";
+      if (tr) { try { spLine = o.speech ? metricsLine(JSON.parse(o.speech)) : ""; } catch {} }
+      const extra = tr ? `<input type="hidden" data-ex="_speech" data-item="${esc(ex.id)}" value="${esc(o.speech || "")}" ${dis}><div class="sp-line" data-sp-line="${esc(ex.id)}">${esc(spLine)}</div>` : "";
+      const ph = o.readOnly ? "" : tr ? "Record your answer above and click Transcribe: the text will appear here." : "Type your answer here…";
+      body = `${it.text}${model}<textarea class="open-answer ${tr ? "transcript" : ""}" rows="${it.rows || 5}" ${attrs} ${tr ? "readonly" : ""} ${NOAUTO} placeholder="${ph}">${esc(val)}</textarea>${extra}${wc}${o.itemExtra ? o.itemExtra(it.id) : ""}${grade}`;
     }
     return `<li${play ? ' class="has-play"' : ""}>${play}${play ? `<div class="li-body">${body}</div>` : body}</li>`;
   }).join("\n");
@@ -506,12 +502,6 @@ function renderImages(items, layout) {
     </figure>`).join("");
   return `<div class="pics ${items.length > 1 ? (layout === "row" ? "row" : "grid") : "one"}">${figs}</div>`;
 }
-// "dur=58;words=96;take=2;model=…;at=…" – what the recorder saved next to a spoken answer
-export function parseSpeakMeta(s) {
-  return Object.fromEntries(String(s || "").split(";").filter(Boolean).map((p) => { const i = p.indexOf("="); return [p.slice(0, i), p.slice(i + 1)]; }));
-}
-const fmtSec = (s) => { s = Math.round(Number(s) || 0); return s >= 60 ? `${Math.floor(s / 60)} min${s % 60 ? ` ${s % 60} s` : ""}` : `${s} s`; };
-
 // speaking timers with a voice recorder: drawn by speaking.js (registered there)
 let speakingImpl = () => "";
 export function registerSpeaking(fn) { speakingImpl = fn; }

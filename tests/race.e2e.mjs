@@ -16,7 +16,7 @@ mock = mock.replace("export async function setDoc(ref, data, opts) {\n  await ti
       if (JSON.stringify(old?.answers?.[ex] ?? null) !== JSON.stringify(data.answers?.[ex] ?? null)) throw err("permission-denied");
   }`);
 const course = readFileSync(new URL("../content-private/test-fixture.json", import.meta.url), "utf8");
-const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium-1194/chrome-linux/chrome" }).catch(() => chromium.launch());
+const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
 await ctx.route("**/js/fb.js*", (r) => r.fulfill({ contentType: "text/javascript", body: mock }));
 const errors = [];
@@ -45,8 +45,6 @@ await s.click('.sb-uh[data-unit="u1"]'); await s.click('.sb-item:has-text("Warm-
 await s.waitForSelector("#ex-m1");
 const m1key = "b d e f a j n m h o i g l k c".split(" ");
 for (let i = 1; i <= 5; i++) await s.fill(sel("m1", String(i)), m1key[i - 1]);
-await s.click('[data-done="m1"]'); await s.locator("#save-state", { hasText: /Sent to your teacher/ }).waitFor({ timeout: 5000 });
-await s.click('[data-undone="m1"]'); await s.waitForTimeout(500);
 await s.waitForTimeout(2000); await s.screenshot({ path: SHOTS + "/s0.png" }); console.log("st0", await s.textContent("#unit-bar"));
 
 // 1) студент вписывает ещё два ответа в 1.1.1, и преподаватель нажимает «Check» раньше, чем они сохранились
@@ -60,7 +58,6 @@ await s.waitForSelector("#ex-m1 .ex-score", { timeout: 5000 });
 // 2) студент продолжает работу в другом упражнении
 await s.fill(sel("m4", "1"), "with");
 await s.fill(sel("m4", "2"), "out");
-await s.click('[data-done="m4"]');   // answers go to the teacher only with Done
 await s.waitForTimeout(2500);
 await s.screenshot({ path: SHOTS + "/after.png", fullPage: false });
 const st = await s.textContent("#save-state").catch(() => "");
@@ -81,7 +78,6 @@ if (!anyDraft) await s.evaluate(() => { const uid = JSON.parse(sessionStorage.ge
 await s.reload();
 await s.click('.sb-item:has-text("Warm-up")').catch(() => {});
 await s.waitForSelector("#ex-m1 .ex-score");
-if (await s.locator('[data-done="m4"]').count()) await s.click('[data-done="m4"]');
 await s.waitForTimeout(2500);
 const d2 = await db(s);
 const sub2 = Object.entries(d2).find(([k]) => k.startsWith("submissions/"))[1];

@@ -4,17 +4,17 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
   doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, orderBy,
   writeBatch, arrayUnion, arrayRemove, serverTimestamp, deleteField,
-} from "./fb.js?v=20261029c";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261029c";
+} from "./fb.js?v=20261111a";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261111a";
 import {
   esc, renderBlocks, renderExercise, exercisesOf, isAuto, gradeAuto, buildResult, keyText, norm,
   fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, KIND_LABEL, isTeacherChecked, gradeExercise, wireFlashcards, isManual,
-  isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2, hashStr,
-} from "./common.js?v=20261029c";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029c";
-import { loadVocab, grammarCheck, vocabProfile, unitVocabulary, feedbackHTML, sleep } from "./writing.js?v=20261029c";
-import "./speaking.js?v=20261029c";
-import { trackedTasks, measure, METRICS, toCSV } from "./progress.js?v=20261029c";
+  isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2,
+} from "./common.js?v=20261111a";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261111a";
+import { loadVocab, checkGrammar, vocabProfile, unitVocabulary, feedbackHTML, sleep, findGrammar, textLevel } from "./writing.js?v=20261111a";
+import "./speaking.js?v=20261111a";
+import { isWritingTask, measure, METRICS, toCSV } from "./progress.js?v=20261111a";
 
 const $ = (s) => document.querySelector(s);
 const ls = {
@@ -34,21 +34,13 @@ const T = {
   unsub: [], ctxUnsub: [],
   practice: {},          // unitId -> {exId: {itemId: value}}: what the teacher types in the unit (kept in this tab only)
   mistOpen: new Set(),   // exercises whose list of students' mistakes is open
+  prog: null,            // Speaking and Writing progress: {gid, loading, tasks, rows, at, error}
+  progOpt: { metric: { speaking: ls.get("progM:speaking", "wpm"), writing: ls.get("progM:writing", "words") }, student: "", setting: ls.get("progSet", ""), open: null },
+  viewAs: "",            // unit page: "" = the teacher's own practice answers, or a student uid whose answers are shown
+  statsOnlySubmitted: false,
   journal: undefined,    // attendance of the current group: {lessons: {"2026-10-21": {absent: [uid]}}}
   unitViewKey: "",
 };
-// Whose answers are shown in the exercise fields of a unit page (per group, remembered in this browser):
-// "me" = the teacher's own practice answers; a student's uid = that student's answers as sent with Done;
-// nothing chosen = the only student of the group (individual lessons), otherwise the teacher's own answers.
-const viewAsKey = () => "viewAs:" + T.gid;
-function viewedStudent() {
-  const v = ls.get(viewAsKey(), "");
-  if (v === "me") return null;
-  const st = T.students.find((s) => s.uid === v) || (T.students.length === 1 ? T.students[0] : null);
-  return st || null;
-}
-const mediaBusy = () => [...document.querySelectorAll("#view audio, #view video")].some((m) => !m.paused && !m.ended)
-  || !!document.querySelector("#view .spk.run, #view .spk-live:not([hidden])");
 // An absent student gets this share of the points for the in-class exercises of that lesson
 const ABSENT_FACTOR = 0.25;
 
@@ -58,7 +50,8 @@ const TOOLS = [
   { id: "tests", icon: "⏱", title: "Tests", sub: "Timed tests: open, watch, check" },
   { id: "stats", icon: "📊", title: "Analytics", sub: "Difficult questions, heat map" },
   { id: "journal", icon: "📅", title: "Attendance", sub: "Lesson dates, present and absent" },
-  { id: "progress", icon: "📈", title: "Progress", sub: "Speaking and writing over time, CSV" },
+  { id: "speaking", icon: "🎙", title: "Speaking progress", sub: "Recordings as text: figures, trends, texts" },
+  { id: "writing", icon: "✍", title: "Writing progress", sub: "Letters and essays: figures, trends, texts" },
   { id: "groups", icon: "👥", title: "Groups & students", sub: "Group codes, moving and removing students" },
   { id: "content", icon: "📦", title: "Course content", sub: "Import units and keys" },
 ];
@@ -119,7 +112,11 @@ function fillCtx() {
   $("#ctx-group").innerHTML = T.groups.map((g) => `<option value="${esc(g.id)}" ${g.id === T.gid ? "selected" : ""}>${esc(g.name || g.id)}</option>`).join("") || `<option value="">no groups yet</option>`;
   $("#ctx-unit").innerHTML = T.units.map((u, i) => `<option value="${esc(u.id)}" ${u.id === T.unitId ? "selected" : ""}>Unit ${u.order || i + 1}</option>`).join("") || `<option value="">no units yet</option>`;
 }
-$("#ctx-group").addEventListener("change", (e) => { T.gid = e.target.value; ls.set("gid", T.gid); T.selected = null; subscribeCtx(); render(); });
+$("#ctx-group").addEventListener("change", (e) => { T.gid = e.target.value; ls.set("gid", T.gid); T.selected = null; T.viewAs = ""; T.viewAsChosen = false; T.progOpt.student = ""; subscribeCtx(); render(); });
+document.addEventListener("change", (e) => {
+  if (e.target.id === "view-as") setViewAs(e.target.value);
+  if (e.target.id === "works-student") { T.selected = e.target.value; render(true); setTimeout(() => $("#detail")?.scrollIntoView({ behavior: "smooth" }), 50); }
+});
 $("#ctx-unit").addEventListener("change", (e) => setUnit(e.target.value));
 function setUnit(id) {
   if (!id || id === T.unitId) return;
@@ -134,11 +131,15 @@ function subscribeCtx() {
   if (key === ctxKey) return;
   ctxKey = key;
   T.ctxUnsub.forEach((u) => u()); T.ctxUnsub = [];
-  T.students = []; T.subs = []; T.results = {};
+  T.students = []; T.subs = []; T.results = {}; T.studentsReady = false;
   if (!T.gid) return;
   // students of the group, their work and results — all in real time
   T.ctxUnsub.push(onSnapshot(query(collection(db, "users"), where("groupId", "==", T.gid)), (snap) => {
     T.students = snap.docs.map((d) => ({ uid: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
+    T.studentsReady = true;
+    // individual lessons: a group with one learner shows that learner's answers on the unit page
+    // until the teacher chooses "My practice" in the Answers shown list
+    if (T.students.length === 1 && !T.viewAsChosen) T.viewAs = T.students[0].uid;
     render();
   }));
   // attendance journal: kept in a teacher-only document (answerKeys/journal~<group>), students never receive it
@@ -213,6 +214,9 @@ function renderNav() {
   });
 }
 
+const mediaBusy = () => [...document.querySelectorAll("#view audio, #view video")].some((m) => !m.paused && !m.ended)
+  || !!document.querySelector("#view .spk.run, #view .spk-live:not([hidden])");
+
 function render(force = false) {
   if (!T.user || $("#app").hidden) return;
   renderNav();
@@ -221,7 +225,7 @@ function render(force = false) {
   // only the live statistics are refreshed. The teacher's own answers, an audio file that is playing,
   // a flashcard or a recorder stay as they are.
   if (!force && r.unit && r.unit === T.unitId && T.unitViewKey && T.unitViewKey === unitViewKey(r)) { patchUnitStats(); return; }
-  // new answers from the student while audio or a recording is playing in class: wait until it stops
+  // the learner's answers changed while audio or a recording is playing in class: wait until it stops
   if (!force && r.unit && r.unit === T.unitId && T.unitViewKey && mediaBusy()) {
     patchUnitStats();
     clearTimeout(T.waitT); T.waitT = setTimeout(() => render(), 3000);
@@ -236,7 +240,7 @@ function render(force = false) {
   if (r.unit) { $("#view").innerHTML = viewUnit(r); T.unitViewKey = unitViewKey(r); return; }
   const tool = TOOLS.find((t) => t.id === r.tool);
   $("#crumb").innerHTML = `<b>Teaching tools</b> &middot; ${tool.title}`;
-  const views = { access: viewAccess, works: viewWorks, tests: viewTests, stats: viewStats, content: viewContent, groups: viewGroups, journal: viewJournal, progress: viewProgress };
+  const views = { access: viewAccess, works: viewWorks, tests: viewTests, stats: viewStats, content: viewContent, groups: viewGroups, journal: viewJournal, speaking: () => viewProgress("speaking"), writing: () => viewProgress("writing") };
   $("#view").innerHTML = views[r.tool]();
 }
 
@@ -264,26 +268,40 @@ function viewUnit(r) {
   for (const note of [...(d.notes[sec.id] || [])].reverse()) blocks.splice(note.at, 0, { type: "teacher-note", html: note.html });
   const prev = secs[i - 1], next = secs[i + 1];
   const mine = T.practice[u.id] || {};
-  const vs = viewedStudent();
-  const vsub = vs ? T.subs.find((s) => s.uid === vs.uid) : null;
-  const vdone = vsub ? doneMap(vsub.answers) : {};
-  const vfb = vs ? T.exr?.[vs.uid]?.feedback || {} : {};
-  return bar + docxBar(u) + pageHead(`Unit ${n} &middot; ${n}.${i + 1}`, esc(sec.title), esc(meta.subtitle || sec.subtitle || ""))
-    + viewAsBar(vs, vsub)
-    + (vs ? "" : `<p class="muted tip">You can type and choose answers here, as the students do: nothing is saved or sent to the students.
-       Under each exercise title you can mark it <b>In-Class</b> or <b>HA</b> and tick <b>Done</b>. The figures on the right update live while the students work.
-       ${Object.keys(mine).length ? `<button class="btn small" data-act="practice-clear" data-unit="${esc(u.id)}">Clear my answers</button>` : ""}</p>`)
+  // "Answers shown": the teacher's own practice answers, or one student's work in this unit
+  // (while the list of students is still loading after a change of unit, the chosen student is kept)
+  if (T.viewAs && T.studentsReady && !T.students.some((s) => s.uid === T.viewAs)) T.viewAs = "";
+  const vs = T.viewAs ? T.subs.find((s) => s.uid === T.viewAs) : null;
+  const vexr = T.viewAs ? T.exr?.[T.viewAs] : null;
+  const vres = T.viewAs ? T.results[T.viewAs] : null;
+  const tip = T.viewAs
+    ? `<p class="muted tip">You see the answers of <b>${esc(T.students.find((s) => s.uid === T.viewAs)?.name || "")}</b>${vs ? ` (${vs.status === "submitted" ? "submitted" : "draft"}, last change ${esc(fmtTime(vs.updatedAt))})` : ""}: green – correct, red – a mistake with the key next to it. The page follows the student's changes live. Marks for open answers are given in <a href="#tools/works" data-act="select-student" data-uid="${esc(T.viewAs)}">Student work</a>.</p>`
+    : `<p class="muted tip">You can type and choose answers here, as the students do: nothing is saved or sent to the students.
+       Under each exercise title you can mark it <b>In-Class</b> or <b>HA</b> and tick <b>Done</b>. The figures on the right update live while the students work (drafts included).
+       ${Object.keys(mine).length ? `<button class="btn small" data-act="practice-clear" data-unit="${esc(u.id)}">Clear my answers</button>` : ""}</p>`;
+  return bar + docxBar(u) + viewAsBar() + pageHead(`Unit ${n} &middot; ${n}.${i + 1}`, esc(sec.title), esc(meta.subtitle || sec.subtitle || ""))
+    + tip
+    + (T.viewAs && !vs ? `<div class="box">This student has not started the unit yet.</div>` : "")
     + renderBlocks(blocks, (ex) => {
       const st = exStats(ex);
-      const sent = vsub && (vdone[ex.id] || vsub.status === "submitted");
-      const sAns = vsub?.answers?.[ex.id] || {};
+      if (T.viewAs) {
+        const ans = vs?.answers?.[ex.id] || {};
+        const fbx = vexr?.feedback?.[ex.id];
+        const done = vs && doneMap(vs.answers)[ex.id];
+        const graded = vs && isAuto(ex) && Object.values(ans).some((v) => String(v).trim());
+        return {
+          key: graded ? null : d.keys[ex.id] || {}, readOnly: true, answers: ans,
+          speech: vs?.answers?._speech?.[ex.id],
+          auto: graded ? gradeExercise(ex, ans, d.keys[ex.id] || {}).items : undefined,
+          manual: vres?.manual?.[ex.id],
+          tag: done ? "Done ✓" : vs && Object.values(ans).some((v) => String(v).trim()) ? "Started, not marked Done" : "",
+          before: g ? toolsBar(u, ex, g, st) : NO_GROUP_BAR,
+          itemExtra: fbx ? (itemId) => feedbackHTML(fbx[itemId], { checkedAt: fmtTime(vexr.feedbackAt?.[ex.id]) }) : null,
+        };
+      }
       return {
-        // when the learner's Done exercise is marked, "Correct: …" already shows the key for wrong answers
-        key: vs && sent && isAuto(ex) ? {} : d.keys[ex.id] || {}, readOnly: !!vs,
-        answers: vs ? sAns : mine[ex.id] || {},
-        auto: vs && sent && isAuto(ex) ? gradeExercise(ex, sAns, d.keys[ex.id] || {}).items : undefined,
-        headExtra: vs ? studentPill(ex, vsub, sent) : "",
-        itemExtra: vs && vfb[ex.id] ? (itemId) => feedbackHTML(vfb[ex.id][itemId], { checkedAt: fmtTime(T.exr[vs.uid].feedbackAt?.[ex.id]) }) : null,
+        key: d.keys[ex.id] || {}, readOnly: false,
+        answers: mine[ex.id] || {},
         tag: ex.check === "teacher" ? (isManual(ex) ? "Writing check by the teacher" : "Checked by the teacher") : "",
         before: g ? toolsBar(u, ex, g, st) : NO_GROUP_BAR,
         itemStat: st.items ? (itemId) => `<span class="istat" data-is="${esc(ex.id)}|${esc(itemId)}">${itemBadge(ex, st.items[itemId])}</span>` : null,
@@ -296,26 +314,38 @@ function viewUnit(r) {
     </nav>`;
 }
 
-// Choice of whose answers fill the exercises on a unit page
-function viewAsBar(vs, vsub) {
-  if (!T.gid || !T.students.length) return "";
-  const cur = vs ? vs.uid : "me";
-  const opts = T.students.map((s) => `<option value="${esc(s.uid)}" ${cur === s.uid ? "selected" : ""}>${esc(s.name)} (student)</option>`).join("")
-    + `<option value="me" ${cur === "me" ? "selected" : ""}>My own answers (practice)</option>`;
-  const info = !vs ? "" : !vsub ? `<span class="muted">${esc(vs.name)} has not sent anything in this unit yet.</span>`
-    : `<span class="muted">Answers appear here when ${esc(vs.name)} clicks <b>Done</b>${vsub.updatedAt ? ` · last sent ${esc(fmtTime(vsub.updatedAt))}` : ""}. Fields are read-only; auto-checked exercises are marked when they are Done.</span>`;
-  return `<div class="viewas"><label>Answers in the exercises <select data-viewas>${opts}</select></label> ${info}</div>`;
+// The list above a unit page: whose answers are shown. Students are in alphabetical order; the arrows go to the
+// previous and next student, so the teacher can look through the whole group exercise by exercise.
+// Without a group In-Class / HA and Done cannot be stored (they are kept per group): show them switched off with a hint
+const NO_GROUP_BAR = `<div class="ex-bar tbar"><div class="tb-row">
+  <span class="seg" role="group" aria-label="Type of work"><button type="button" disabled>In-Class</button><button type="button" disabled>HA</button></span>
+  <label class="tb-done"><input type="checkbox" disabled> Done</label>
+  <span class="muted" style="font-size:12.5px">Create a group in <a href="#tools/groups">Groups &amp; students</a> to mark In-Class / HA and the date</span></div></div>`;
+
+function viewAsBar() {
+  if (!group() || !T.students.length) return "";
+  const subBy = Object.fromEntries(T.subs.map((s) => [s.uid, s]));
+  const i = T.students.findIndex((s) => s.uid === T.viewAs);
+  const prev = i > 0 ? T.students[i - 1] : null, next = i < T.students.length - 1 ? T.students[i + 1] : null;
+  const label = (s) => { const x = subBy[s.uid]; return `${s.name}${!x ? " · not started" : x.status === "submitted" ? " · submitted" : ""}`; };
+  return `<div class="viewas-bar ${T.viewAs ? "on" : ""}"><label for="view-as">Answers shown</label>
+    <button class="btn small" data-act="view-as" data-uid="${esc(prev?.uid || "")}" ${i < 0 || !prev ? "disabled" : ""} title="Previous student">Previous</button>
+    <select id="view-as"><option value="">My practice (nothing is saved)</option>${T.students.map((s) => `<option value="${esc(s.uid)}" ${s.uid === T.viewAs ? "selected" : ""}>${esc(label(s))}</option>`).join("")}</select>
+    <button class="btn small" data-act="view-as" data-uid="${esc((i < 0 ? T.students[0] : next)?.uid || "")}" ${i >= 0 && !next ? "disabled" : ""} title="Next student">Next</button>
+    ${T.viewAs ? `<button class="btn small" data-act="view-as" data-uid="">Back to my practice</button>` : ""}</div>`;
 }
-function studentPill(ex, vsub, sent) {
-  if (!vsub) return `<span class="sp-pill off">not sent</span>`;
-  if (!sent) return `<span class="sp-pill off">not Done yet</span>`;
-  return `<span class="sp-pill on">Done</span>`;
+function viewAsStamp() {
+  const s = T.subs.find((x) => x.uid === T.viewAs), e = T.exr?.[T.viewAs], r = T.results[T.viewAs];
+  const ms = (t) => t?.toMillis?.() || 0;
+  return [ms(s?.updatedAt), s?.status || "", Object.values(e?.feedbackAt || {}).reduce((n, t) => n + ms(t), 0), ms(r?.gradedAt)].join("|");
 }
-document.addEventListener("change", (e) => {
-  if (!e.target.matches?.("[data-viewas]")) return;
-  ls.set(viewAsKey(), e.target.value);
+function setViewAs(uid) {
+  T.viewAs = uid || "";
+  T.viewAsChosen = true;
+  const y = window.scrollY;
   render(true);
-});
+  window.scrollTo(0, y);
+}
 
 // Download the whole unit as a Word file (no interactive elements): Student's Book or Teacher's Book with keys
 function docxBar(u) {
@@ -331,7 +361,7 @@ async function downloadDocx(unitId, ver, btn) {
   try {
     const d = await loadUnitData(unitId);
     if (!d?.content) throw new Error("This unit has no content yet.");
-    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261029c");
+    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261111a");
     const teacher = ver === "teacher";
     const sections = d.content.sections.map((s) => ({ ...s, subtitle: (u.sections || []).find((m) => m.id === s.id)?.subtitle || s.subtitle || "" }));
     const blob = await exportUnitDocx({ courseTitle: COURSE_TITLE, unitNum: unitNum(u), unitTitle: u.title, sections,
@@ -372,12 +402,6 @@ function toolsBar(u, ex, g, st) {
   const check = ex.check === "teacher" ? (isManual(ex) ? writingBar(u, ex, g) : exerciseBar(u, ex, g)) : "";
   return `<div class="ex-bar tbar">${row}${check}</div>`;
 }
-
-// Without a group In-Class / HA and Done cannot be stored (they are kept per group): show them switched off with a hint
-const NO_GROUP_BAR = `<div class="ex-bar tbar"><div class="tb-row">
-  <span class="seg" role="group" aria-label="Type of work"><button type="button" disabled>In-Class</button><button type="button" disabled>HA</button></span>
-  <label class="tb-done"><input type="checkbox" disabled> Done</label>
-  <span class="muted" style="font-size:12.5px">Create a group in <a href="#tools/groups">Groups &amp; students</a> to mark In-Class / HA and the date</span></div></div>`;
 
 // students of the group and their answers in this exercise (drafts and submitted work)
 function exStats(ex) {
@@ -433,15 +457,10 @@ function unitViewKey(r) {
   if (!u || !d?.content) return "";
   return JSON.stringify([u.id, r.section || "", T.gid, u.status, !!g?.openUnits?.includes(u.id), !!g?.releasedUnits?.includes(u.id),
     g?.releasedEx?.[u.id] || [], g?.feedbackEx?.[u.id] || [], g?.plan?.[u.id] || {}, Object.keys(T.practice[u.id] || {}).length > 0,
-    viewedKey()]);
-}
-// the viewed student's sent answers and writing feedback: the page is drawn again when they change
-function viewedKey() {
-  const vs = viewedStudent();
-  if (!vs) return "me";
-  const sub = T.subs.find((s) => s.uid === vs.uid);
-  const fb = T.exr?.[vs.uid]?.feedbackAt || {};
-  return vs.uid + "|" + (sub ? hashStr(JSON.stringify([sub.answers || {}, sub.status || ""])) : "-") + "|" + hashStr(JSON.stringify(fb));
+    // a student's answers on the page: drawn again when the student changes them or gets feedback
+    T.viewAs, T.viewAs ? viewAsStamp() : "",
+    // the list "Answers shown" is drawn again when the students of the group have loaded
+    T.students.map((x) => x.uid).join(",")]);
 }
 function patchUnitStats() {
   const d = T.unitData[T.unitId];
@@ -608,9 +627,14 @@ function writingBar(u, ex, g) {
   return `<div class="tb-row"><span>Group <b>${esc(g.name)}</b>: <span class="pill ${done ? "on" : "off"}">${done ? "feedback shown" : "not checked yet"}</span></span>
     <span class="sp" style="flex:1"></span>
     <span id="wcheck-progress" class="muted"></span>
-    <button class="btn small good" data-act="check-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}" ${g.openUnits.includes(u.id) ? "" : "disabled"}>${done ? "Check again" : (ex.items || []).some((it) => it.speak) ? "Check the speaking now" : "Check the writing now"}</button>
+    <button class="btn small good" data-act="check-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}" ${g.openUnits.includes(u.id) ? "" : "disabled"}>${done ? "Check again" : "Check the writing now"}</button>
     ${done ? `<button class="btn small danger" data-act="hide-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}">Hide feedback</button>` : ""}
   </div>`;
+}
+
+// The unit's grammar structures (course file: "grammar" on the unit, or on an exercise to replace it)
+function unitGrammar(content, ex) {
+  return ex?.grammar || content?.grammar || [];
 }
 
 async function checkWriting(gid, unitId, exId) {
@@ -619,32 +643,39 @@ async function checkWriting(gid, unitId, exId) {
     const ex = exercisesOf(content).find((e) => e.id === exId);
     const subs = (await getDocs(query(collection(db, "submissions"), where("groupId", "==", gid), where("unitId", "==", unitId)))).docs.map((d) => d.data())
       .filter((s) => Object.values(s.answers?.[exId] || {}).some((v) => String(v).trim()));
-    if (!confirm(`Check the writing in “${ex.title}”?\nStudents with answers: ${subs.length}.\nThe texts are sent to LanguageTool for the grammar check (about 3 seconds per student). Students will see the feedback and can correct their texts.`)) return;
+    if (!confirm(`Check the writing in “${ex.title}”?\nStudents with answers: ${subs.length}.\nThe texts are sent to LanguageTool for the grammar check (about 3 seconds per student) and checked on this computer by Harper and the course rules. Students will see the feedback and can correct their texts.`)) return;
     const V = await loadVocab();
     const phrases = unitVocabulary(content);
+    const gIds = unitGrammar(content, ex);
     let n = 0, ltFailed = 0;
     for (const s of subs) {
       n++;
       const prog = document.querySelector("#wcheck-progress");
       if (prog) prog.textContent = `Checking ${n} of ${subs.length}…`;
-      // only the answers themselves (not what the recorder saved next to a spoken answer: "1~m")
-      const texts = Object.fromEntries((ex.items || []).map((it) => [it.id, s.answers[exId]?.[it.id] || ""]));
-      let issues = {}, grammarError = false;
-      try { issues = await grammarCheck(texts); } catch (e) { console.warn(e); grammarError = true; ltFailed++; }
+      const plainIds = new Set((ex.items || []).filter((it) => it.plain).map((it) => it.id));
+      const texts = Object.fromEntries(Object.entries(s.answers[exId] || {}).filter(([id]) => !plainIds.has(id)));
+      const { issues, ltError, harperError } = await checkGrammar(texts);
+      const grammarError = false;
+      if (ltError) ltFailed++;
       const fb = {};
       for (const it of ex.items || []) {
+        if (it.plain) continue;                     // a partner's name: nothing to check
         const text = String(texts[it.id] || "");
         if (!text.trim()) continue;
-        fb[it.id] = { text, issues: issues[it.id] || [], grammarError, vocab: vocabProfile(text, V, phrases), unitTotal: phrases.length };
+        const vocab = vocabProfile(text, V, phrases);
+        fb[it.id] = { text, issues: issues[it.id] || [], grammarError, ltError, harperError, vocab, unitTotal: phrases.length,
+          level: textLevel(vocab.counts), grammar: findGrammar(text, gIds) };
+        // a transcribed speaking task: the measurements of the speech (length, speed, pauses) go with the feedback
+        if (ex.transcript && it === ex.items[0] && s.answers?._speech?.[exId]) { try { fb[it.id].speech = JSON.parse(s.answers._speech[exId]); } catch {} }
       }
       await setDoc(doc(db, "exerciseResults", subId(unitId, s.uid)), {
         uid: s.uid, groupId: gid, unitId,
         feedback: { [exId]: fb }, feedbackAt: { [exId]: serverTimestamp() },
       }, { merge: true });
-      if (n < subs.length && !grammarError) await sleep(3200);   // LanguageTool: at most 20 requests a minute
+      if (n < subs.length && !ltError) await sleep(3200);   // LanguageTool: at most 20 requests a minute
     }
     await updateDoc(doc(db, "groups", gid), { [`feedbackEx.${unitId}`]: arrayUnion(exId) });
-    toast(ltFailed ? `Done. The grammar check was not available for ${ltFailed} of ${subs.length}; the vocabulary check worked.` : `Done: ${subs.length} texts checked. Students can see the feedback now.`, 7000);
+    toast(ltFailed ? `Done. LanguageTool was not available for ${ltFailed} of ${subs.length}; Harper, the course rules and the vocabulary check worked.` : `Done: ${subs.length} texts checked. Students can see the feedback now.`, 7000);
   });
 }
 
@@ -659,6 +690,294 @@ function accessBar(u, g) {
     </span>
     <span class="muted" style="flex-basis:100%;font-size:13px">To check one exercise, use the green button above it. The whole unit is checked only in <a href="#tools/access">Access &amp; results</a>.</span></div>`;
 }
+
+// ================================================================== Speaking and Writing progress
+// One page for each skill, the same layout: the group table (task by task, with the change and a trend line) and a chart
+// of the chosen measure, then a card for every student with all their texts and figures. A student can be chosen
+// in the list: the chart then shows this student against the group mean.
+// Speaking: every exercise with "transcript" (the text Whisper wrote from a recording, alone or a pair discussion).
+// Writing: open exercises marked "track": "writing", or one-text tasks in the Writing section (a letter, an essay…).
+async function loadProgress() {
+  const gid = T.gid;
+  T.prog = { gid, loading: true };
+  try {
+    const V = await loadVocab();
+    const tasks = [];
+    for (const u of [...T.units].filter((x) => x.status !== "soon").sort((a, b) => unitNum(a) - unitNum(b))) {
+      const { content } = await loadUnitData(u.id);
+      if (!content) continue;
+      const nums = exerciseNumbers(content, unitNum(u));
+      const unitPhrases = unitVocabulary(content);
+      for (const ex of exercisesOf(content)) {
+        const skill = ex.transcript ? "speaking" : isWritingTask(ex) ? "writing" : "";
+        if (!skill) continue;
+        const it = (ex.items || []).find((x) => !x.plain);
+        if (!it) continue;
+        // several answer fields (translations, own sentences): measured as one text, items in order
+        const itemIds = (ex.items || []).filter((x) => !x.plain).map((x) => x.id);
+        const own = Array.isArray(ex.vocab) && ex.vocab.length ? ex.vocab : null;
+        tasks.push({ key: `${u.id}/${ex.id}`, skill, unitId: u.id, unitNo: unitNum(u), ex, itemId: it.id, num: nums[ex.id] || "",
+          title: ex.title || "", prompt: new DOMParser().parseFromString(String(it.text || ex.rubric || "").replace(/<[^>]+>/g, " "), "text/html").body.textContent.replace(/\s+/g, " ").trim(),
+          phrases: own || unitPhrases, phrasesOwn: !!own, itemIds, grammar: unitGrammar(content, ex),
+          partnerId: (ex.items || []).find((x) => x.plain)?.id || "" });
+      }
+    }
+    const [subs, exrs] = await Promise.all([
+      getDocs(query(collection(db, "submissions"), where("groupId", "==", gid))),
+      getDocs(query(collection(db, "exerciseResults"), where("groupId", "==", gid))),
+    ]);
+    const exrOf = {};
+    exrs.docs.forEach((d) => { const x = d.data(); exrOf[subId(x.unitId, x.uid)] = x; });
+    const rows = [];
+    for (const d of subs.docs) {
+      const sub = d.data();
+      for (const t of tasks) {
+        if (t.unitId !== sub.unitId) continue;
+        const parts = t.itemIds.map((id) => String(sub.answers?.[t.ex.id]?.[id] || "").trim());
+        const text = parts.filter(Boolean).join("\n");
+        if (!text) continue;
+        let sp = null;
+        if (t.skill === "speaking") { try { sp = JSON.parse(sub.answers?._speech?.[t.ex.id] || "null"); } catch {} }
+        const fbAll = exrOf[subId(sub.unitId, sub.uid)]?.feedback?.[t.ex.id];
+        let fb = fbAll?.[t.itemId];
+        if (fbAll && t.itemIds.length > 1) {          // join the feedback of all items the same way as the texts
+          const f = t.itemIds.map((id) => fbAll[id]).filter((x, i) => parts[i]);
+          fb = f.length && f.every(Boolean) ? { text: f.map((x) => String(x.text || "").trim()).join("\n"), issues: f.flatMap((x) => x.issues || []), grammarError: f.some((x) => x.grammarError) } : (f.some(Boolean) ? { text: "", issues: [] } : undefined);
+        }
+        rows.push({
+          uid: sub.uid, key: t.key, skill: t.skill, text, status: sub.status,
+          partner: t.partnerId ? String(sub.answers?.[t.ex.id]?.[t.partnerId] || "").trim() : "",
+          at: sp?.at || sub.updatedAt?.toMillis?.() || 0, atExact: !!sp?.at,
+          m: measure(text, V, t.phrases, fb, sp, t.grammar),
+        });
+      }
+    }
+    if (T.prog?.gid === gid) T.prog = { gid, tasks, rows, at: new Date() };
+  } catch (e) {
+    console.warn(e);
+    if (T.prog?.gid === gid) T.prog = { gid, error: friendlyError(e) };
+  }
+  if (["speaking", "writing"].includes(route().tool)) render(true);
+}
+
+const n1 = (x) => (Math.round(x * 10) / 10).toString();
+const fmtV = (v, id) => (v === null || v === undefined || Number.isNaN(v) ? "–" : id === "mattr" ? Number(v).toFixed(2) : String(v));
+const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, "0")}`;
+
+function sparkline(vals, dir) {
+  const pts = vals.map((v, i) => [i, v]).filter(([, v]) => typeof v === "number");
+  if (pts.length < 2) return "";
+  const W = 90, H = 24, xs = vals.length - 1 || 1;
+  const lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1])), span = hi - lo || 1;
+  const P = pts.map(([i, v]) => [(4 + (i / xs) * (W - 8)).toFixed(1), (H - 4 - ((v - lo) / span) * (H - 8)).toFixed(1)]);
+  const up = (pts[pts.length - 1][1] - pts[0][1]) * dir >= 0;
+  const c = `var(${up ? "--ok" : "--bad"})`;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true"><polyline points="${P.map((p) => p.join(",")).join(" ")}" fill="none" stroke="${c}" stroke-width="1.8"/>${P.map(([x, y]) => `<circle cx="${x}" cy="${y}" r="1.8" fill="${c}"/>`).join("")}</svg>`;
+}
+
+function progressChart(tasks, series, mean, M, one) {
+  const all = [...series.flatMap((s) => s.vals), ...mean].filter((v) => typeof v === "number");
+  if (!all.length || tasks.length < 2) return "";
+  const W = 640, H = 220, L = 44, R = 12, Tp = 14, B = 34;
+  const lo = Math.min(0, ...all), hi = Math.max(...all) || 1;
+  const x = (i) => L + (i / (tasks.length - 1)) * (W - L - R);
+  const y = (v) => Tp + (1 - (v - lo) / (hi - lo || 1)) * (H - Tp - B);
+  const line = (vals) => { const p = vals.map((v, i) => (typeof v === "number" ? `${x(i).toFixed(1)},${y(v).toFixed(1)}` : null)).filter(Boolean); return p.length > 1 ? p.join(" ") : ""; };
+  const dots = (vals, cls, who) => vals.map((v, i) => (typeof v === "number" ? `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" class="${cls}"><title>T${i + 1}: ${esc(who)} ${fmtV(v, M.id)}</title></circle>` : "")).join("");
+  const ticks = [lo, (lo + hi) / 2, hi].map((v) => `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" class="ax">${fmtV(Math.round(v * 100) / 100, M.id)}</text><line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" class="grid"/>`).join("");
+  const xl = tasks.map((t, i) => `<text x="${x(i)}" y="${H - 12}" text-anchor="middle" class="ax">T${i + 1}</text>`).join("");
+  const st = series.map((s) => { const p = line(s.vals); return (p ? `<polyline points="${p}" class="st${one ? " one" : ""}"><title>${esc(s.name)}</title></polyline>` : "") + (one ? dots(s.vals, "one", s.name) : ""); }).join("");
+  const mp = line(mean);
+  return `<figure class="prog-chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(M.label)} by task">${ticks}${xl}${mp ? `<polyline points="${mp}" class="mn"/>` : ""}${dots(mean, "mn", "group mean")}${st}</svg>
+    <figcaption><span class="lg mn"></span> group mean &nbsp; <span class="lg st${one ? " one" : ""}"></span> ${one ? esc(series[0]?.name || "") : "individual students (hover for the name)"}</figcaption></figure>`;
+}
+
+function viewProgress(skill) {
+  const g = group();
+  const isSp = skill === "speaking";
+  const head = pageHead("Teaching tools", isSp ? "Speaking progress" : "Writing progress", isSp
+    ? "Every recording a student has turned into text (Whisper, in the student's browser), task by task. Recordings made alone and pair discussions are marked, because their figures are not the same thing."
+    : "Every tracked text a student has written (letters, essays and other one-text tasks), task by task.");
+  if (!g) return head + `<div class="box">Choose a group at the top of the page.</div>`;
+  if (!T.prog || T.prog.gid !== T.gid) { loadProgress(); return head + `<p class="muted">Loading the texts of group ${esc(g.name)}…</p>`; }
+  if (T.prog.loading) return head + `<p class="muted">Loading the texts of group ${esc(g.name)}…</p>`;
+  if (T.prog.error) return head + `<div class="box">The data could not be loaded: ${esc(T.prog.error)} <button class="btn small" data-act="prog-reload">Try again</button></div>`;
+  const O = T.progOpt;
+  // In-Class or HA: what the teacher marked above the exercise (the same mark as for attendance)
+  const setOf = (t) => g.plan?.[t.unitId]?.[t.ex.id]?.as || "";
+  const SET = { class: "In-Class", home: "HA" };
+  const tagOf = (t) => (setOf(t) ? `<span class="set-tag ${setOf(t)}">${SET[setOf(t)]}</span>` : "");
+  const tasksAll = T.prog.tasks.filter((t) => t.skill === skill);
+  const tasks = O.setting ? tasksAll.filter((t) => setOf(t) === O.setting) : tasksAll;
+  const metrics = METRICS.filter((m) => !m.skill || m.skill === skill);
+  const M = metrics.find((m) => m.id === O.metric[skill]) || metrics[0];
+  const studs = T.students;
+  if (O.student && !studs.some((s) => s.uid === O.student)) O.student = "";
+  const shown = O.student ? studs.filter((s) => s.uid === O.student) : studs;
+  const by = new Map(T.prog.rows.filter((r) => r.skill === skill).map((r) => [r.uid + "|" + r.key, r]));
+  const val = (uid, t) => { const r = by.get(uid + "|" + t.key); return r ? r.m[M.id] : undefined; };
+  const seriesAll = studs.map((s) => ({ name: s.name, uid: s.uid, vals: tasks.map((t) => val(s.uid, t)) }));
+  const series = O.student ? seriesAll.filter((s) => s.uid === O.student) : seriesAll;
+  const mean = tasks.map((t, i) => { const v = seriesAll.map((s) => s.vals[i]).filter((x) => typeof x === "number"); return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 100) / 100 : null; });
+  const counts = tasks.map((t, i) => seriesAll.filter((s) => typeof s.vals[i] === "number").length);
+
+  const controls = `<div class="prog-ctl">
+      <label>Student <select id="prog-student"><option value="">All students (${studs.length})</option>${studs.map((s) => `<option value="${esc(s.uid)}" ${s.uid === O.student ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label>
+      <span class="seg prog-set" role="group" aria-label="In class or at home">${[["", "All tasks"], ["class", "In-Class"], ["home", "HA"]].map(([v, l]) => `<button type="button" class="${O.setting === v ? "on" : ""}" data-act="prog-set" data-set="${v}">${l}</button>`).join("")}</span>
+      <label>Measure <select id="prog-metric" data-skill="${skill}">${metrics.map((m) => `<option value="${m.id}" ${m.id === M.id ? "selected" : ""}>${esc(m.label)}</option>`).join("")}</select></label>
+      <span style="flex:1"></span>
+      <span class="muted" style="font-size:13px">Group <b>${esc(g.name)}</b> · ${esc(fmtTime(T.prog.at))}</span>
+      <button class="btn small" data-act="prog-reload">Refresh</button>
+      <button class="btn small primary" data-act="prog-csv" title="Speaking and writing, every student and task, for research">Download all data (.csv)</button>
+    </div>`;
+  if (!tasks.length && O.setting) return head + controls + `<div class="box">No ${isSp ? "speaking" : "writing"} task is marked <b>${SET[O.setting]}</b> yet. Mark tasks with the In-Class / HA buttons above each exercise in the unit.</div>`;
+  if (!tasks.length) return head + controls + `<div class="box">${isSp ? "There are no exercises with speech turned into text in the open units yet." : "There are no tracked writing tasks in the open units yet. A task is tracked when it is a one-text exercise in the Writing section (a letter, an essay…) or is marked <code>\"track\": \"writing\"</code> in the course file."}</div>`;
+
+  const help = `<details class="box"><summary><b>How to read the figures</b></summary><ul>
+    ${isSp ? `<li><b>Spoke</b> – time with speech in the recording (of the whole recording); <b>words per minute</b> – speed while speaking; <b>pauses</b> – silences longer than one second, per minute of recording.</li>` : `<li><b>Words per sentence</b> and <b>subordinating words</b> (<i>because, although, which, who, when, if…</i> per 100 words) show how complex the sentences are.</li>`}
+    <li><b>Errors per 100 words</b> – issues found by the course rules, LanguageTool and Harper, except punctuation, spelling of spaces and style. They appear after you click <b>Check the writing now</b> above the exercise, and only while the text is the same as at the check.${isSp ? " The speech program sometimes corrects students’ mistakes, so the real number is higher; compare students with themselves, not with each other." : ""}</li>
+    <li><b>Unit grammar</b> – how many times the student used the structures of the unit (for example the passive and infinitive forms), found automatically from the words of the text; the list is in the detail panel. It is approximate: compare a student with themselves over time.</li>
+    <li><b>MATTR-50</b> – lexical diversity: the share of different words in every 50-word window (Covington &amp; McFall, 2010); it does not depend on the length of the text.</li>
+    <li><b>B2+ words</b> – the share of words from the higher levels of the word lists (CEFR-J A1–B2, Octanove C1–C2).</li>
+    <li><b>${isSp ? "Task phrases" : "Unit phrases"}</b> – ${isSp ? "phrases from the exercise list that were used (passing the turn, building on an idea, disagreeing…)" : "words and phrases of the unit vocabulary that were used"}.</li>
+    ${isSp ? `<li>In a <b>pair discussion</b> the program does not separate the two voices: the figures describe the pair, and the text is in the account of the student who recorded it. The partner’s name is next to it.</li>` : ""}
+    <li><b>Change</b> – the last value minus the first; green means better, red means worse for this measure. Click a figure in the table to see the text.</li>
+  </ul></details>`;
+
+  const taskHead = tasks.map((t, i) => `<th title="${esc(`${t.num} ${t.title} – ${t.prompt}`)}">T${i + 1}<span class="s">${esc(t.num)}${setOf(t) ? ` · ${SET[setOf(t)]}` : ""}</span></th>`).join("");
+  const rowsHTML = series.map((s) => {
+    const nums = s.vals.filter((v) => typeof v === "number");
+    const change = nums.length > 1 ? Math.round((nums[nums.length - 1] - nums[0]) * 100) / 100 : null;
+    const good = change !== null && change * M.dir > 0, bad = change !== null && change * M.dir < 0;
+    return `<tr><td class="nm"><a href="#" data-act="prog-student" data-uid="${esc(s.uid)}" title="Show only this student">${esc(s.name)}</a></td>${s.vals.map((v, i) => `<td class="num">${typeof v === "number" ? `<a href="#" data-act="prog-open" data-uid="${esc(s.uid)}" data-key="${esc(tasks[i].key)}">${fmtV(v, M.id)}</a>` : by.has(s.uid + "|" + tasks[i].key) ? `<a href="#" class="muted" data-act="prog-open" data-uid="${esc(s.uid)}" data-key="${esc(tasks[i].key)}" title="Text is there; not checked yet">text</a>` : `<span class="muted">–</span>`}</td>`).join("")}
+      <td class="num ${good ? "up" : bad ? "down" : ""}">${change === null ? "–" : (change > 0 ? "+" : "") + fmtV(change, M.id)}</td><td>${sparkline(s.vals, M.dir)}</td></tr>`;
+  }).join("");
+  const table = `<div class="tscroll"><table class="t prog"><thead><tr><th>Student${O.student ? ` <a href="#" data-act="prog-student" data-uid="" class="all-link">show all</a>` : ""}</th>${taskHead}<th>Change</th><th>Trend</th></tr></thead>
+    <tbody>${rowsHTML}</tbody>
+    <tfoot><tr><td><b>Group mean</b></td>${mean.map((v) => `<td class="num"><b>${fmtV(v, M.id)}</b></td>`).join("")}<td></td><td>${sparkline(mean, M.dir)}</td></tr>
+      <tr><td class="muted">Answers</td>${counts.map((c) => `<td class="num muted">${c}</td>`).join("")}<td></td><td></td></tr></tfoot></table></div>`;
+  const legend = `<ol class="prog-tasks">${tasks.map((t, i) => `<li><b>T${i + 1}</b> · ${esc(t.num)} ${esc(t.title)} ${tagOf(t)}${t.ex.pair ? " · pair discussion" : ""} <span class="muted">${esc(t.prompt.slice(0, 110))}${t.prompt.length > 110 ? "…" : ""}</span></li>`).join("")}</ol>`;
+
+  // the text and every figure of one answer (clicked in the table)
+  let detail = "";
+  if (O.open) {
+    const r = by.get(O.open.uid + "|" + O.open.key), t = tasks.find((x) => x.key === O.open.key), st = studs.find((x) => x.uid === O.open.uid);
+    if (r && t) {
+      const m = r.m;
+      const facts = [["Words", m.words],
+        ...(isSp ? [["Spoke", m.total ? `${mmss(m.speech)} of ${mmss(m.total)}` : "–"], ["Words per minute", fmtV(m.wpm)], ["Pauses", m.pauses === null ? "–" : `${m.pauses} (${fmtV(m.pausesPerMin)} a minute, longest ${m.longest} s)`]]
+          : [["Words per sentence", m.sentLen]]),
+        ["Subordinating words / 100", m.subPer100], ["MATTR-50", fmtV(m.mattr, "mattr")], ["B2+ words", m.b2plus + "%"], ["C1+ words", m.c1plus + "%"],
+        [isSp ? "Task phrases" : "Unit phrases", `${m.phrases}${t.phrasesOwn ? ` of ${t.phrases.length}` : ""}${m.phraseList.length ? ` (${esc(m.phraseList.join(", "))})` : ""}`],
+        ["Unit grammar", m.gramOn ? (m.gramUses ? `${m.gramUses} (${m.gramTypes} different): ${esc(m.gramList.join(", "))}` : "none") : "no grammar set for this unit"],
+        ["Vocabulary level", m.level ? `${m.level} (95% of the listed words)` : "–"],
+        ["Grammar check", m.ltChecked ? `${m.ltAll} issues, ${m.ltGrammar} grammar · ${m.errPer100} errors per 100 words` : m.ltStale ? "the text was changed after the check" : "not checked yet"]];
+      detail = `<div class="box prog-detail" id="prog-detail"><div class="row" style="justify-content:space-between"><b>${esc(st?.name || "")} · T${tasks.indexOf(t) + 1} · ${esc(t.num)} ${esc(t.title)}</b>
+        <button class="btn small" data-act="prog-close">Close</button></div>
+        <p class="muted">${esc(t.prompt)}${r.partner ? ` · pair with ${esc(r.partner)}` : ""}</p>
+        <div class="prog-text">${esc(r.text)}</div>
+        ${m.checkedText && m.checkedText.trim() !== r.text ? `<details><summary>Text at the time of the check</summary><div class="prog-text">${esc(m.checkedText)}</div></details>` : ""}
+        <dl class="prog-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl></div>`;
+    }
+  }
+
+  // In class against at home, for the chosen measure: each student's mean in each setting, then the group
+  const avgOf = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+  const setMean = (uid, set) => avgOf(tasksAll.filter((t) => setOf(t) === set).map((t) => by.get(uid + "|" + t.key)?.m[M.id]).filter((v) => typeof v === "number"));
+  const cmp = Object.fromEntries(studs.map((s) => [s.uid, { c: setMean(s.uid, "class"), h: setMean(s.uid, "home") }]));
+  const both = studs.filter((s) => cmp[s.uid].c !== null && cmp[s.uid].h !== null);
+  const nC = tasksAll.filter((t) => setOf(t) === "class").length, nH = tasksAll.filter((t) => setOf(t) === "home").length;
+  const fmtM = (v) => (v === null ? "–" : fmtV(Math.round(v * 100) / 100, M.id));
+  const dCell = (c, h) => { if (c === null || h === null) return `<td class="num muted">–</td>`; const d = Math.round((h - c) * 100) / 100; return `<td class="num ${d * M.dir > 0 ? "up" : d * M.dir < 0 ? "down" : ""}">${d > 0 ? "+" : ""}${fmtV(d, M.id)}</td>`; };
+  let compare = "";
+  if (nC && nH) {
+    const gc = avgOf(both.map((s) => cmp[s.uid].c)), gh = avgOf(both.map((s) => cmp[s.uid].h));
+    const list = O.student ? shown : studs;
+    compare = `<h3 class="prog-h">In class and at home: ${esc(M.label)}</h3>
+      <p class="muted" style="font-size:13px">${nC} ${nC === 1 ? "task" : "tasks"} marked In-Class, ${nH} marked HA. Each figure is the student's mean over the tasks of that kind; the group line uses only the ${both.length} ${both.length === 1 ? "student" : "students"} who have both. “HA minus In-Class”: green – better at home, red – better in class.</p>
+      <div class="tscroll"><table class="t prog"><thead><tr><th>Student</th><th>In-Class</th><th>HA</th><th>HA minus In-Class</th></tr></thead><tbody>
+      ${list.map((s) => `<tr><td class="nm">${esc(s.name)}</td><td class="num">${fmtM(cmp[s.uid].c)}</td><td class="num">${fmtM(cmp[s.uid].h)}</td>${dCell(cmp[s.uid].c, cmp[s.uid].h)}</tr>`).join("")}
+      </tbody><tfoot><tr><td><b>Group mean</b></td><td class="num"><b>${fmtM(gc)}</b></td><td class="num"><b>${fmtM(gh)}</b></td>${dCell(gc, gh)}</tr></tfoot></table></div>`;
+  } else {
+    compare = `<p class="muted" style="font-size:13px">To compare work done in class with home assignments, mark the ${isSp ? "speaking" : "writing"} tasks <b>In-Class</b> or <b>HA</b> above each exercise in the unit${nC || nH ? ` (now: ${nC} In-Class, ${nH} HA)` : ""}.</p>`;
+  }
+
+  // a card for each student: every text in order with its figures
+  const taskOf = Object.fromEntries(tasks.map((t, i) => [t.key, { t, i }]));
+  const diff = (a, b, d = 0) => { const x = b - a, v = d ? n1(Math.abs(x)) : Math.round(Math.abs(x)); return +v === 0 ? "no change" : (x > 0 ? "+" : "−") + v; };
+  const firstLast = (rows) => {
+    if (rows.length < 2) return `<p class="muted">One ${isSp ? "recording" : "text"} so far: the changes will appear after the next one.</p>`;
+    const a = rows[0].m, b = rows[rows.length - 1].m, out = [];
+    out.push(`words ${a.words} then ${b.words} (${diff(a.words, b.words)})`);
+    if (isSp && a.wpm && b.wpm) out.push(`words per minute ${a.wpm} then ${b.wpm} (${diff(a.wpm, b.wpm)})`);
+    if (isSp && a.pausesPerMin !== null && b.pausesPerMin !== null) out.push(`pauses per minute ${n1(a.pausesPerMin)} then ${n1(b.pausesPerMin)} (${diff(a.pausesPerMin, b.pausesPerMin, 1)})`);
+    if (!isSp) out.push(`words per sentence ${n1(a.sentLen)} then ${n1(b.sentLen)} (${diff(a.sentLen, b.sentLen, 1)})`);
+    const ga = rows.find((r) => r.m.errPer100 !== null), gb = [...rows].reverse().find((r) => r.m.errPer100 !== null);
+    if (ga && gb && ga !== gb) out.push(`errors per 100 words ${n1(ga.m.errPer100)} then ${n1(gb.m.errPer100)} (${diff(ga.m.errPer100, gb.m.errPer100, 1)})`);
+    out.push(`B2+ words ${Math.round(a.b2plus)}% then ${Math.round(b.b2plus)}% (${diff(a.b2plus, b.b2plus)})`);
+    const ta = taskOf[rows[0].key].t, tb = taskOf[rows[rows.length - 1].key].t;
+    return `<p><b>First and last (${esc(ta.num)} and ${esc(tb.num)}):</b> ${out.join(" · ")}.</p>`
+      + (isSp && !!ta.ex.pair !== !!tb.ex.pair ? `<p class="muted">One of them was made alone and the other in a pair, so compare with care.</p>` : "");
+  };
+  const cols = isSp
+    ? ["Exercise", "Date", "Recorded", "Spoke", "Words", "Words per minute", "Pauses", "Errors per 100 words", "Task phrases", "Unit grammar", "B2+ words", "MATTR"]
+    : ["Exercise", "Date", "Words", "Words per sentence", "Subordinating / 100", "Errors per 100 words", "Unit phrases", "Unit grammar", "B2+ words", "MATTR"];
+  const errCell = (m) => (m.errPer100 !== null ? n1(m.errPer100) : `<span class="muted">${m.ltStale ? "text changed after the check" : "not checked"}</span>`);
+  const row = (r) => {
+    const { t } = taskOf[r.key], m = r.m;
+    const date = r.at ? esc((r.atExact ? "" : "about ") + new Date(r.at).toLocaleDateString("ru-RU")) : "—";
+    const ph = `<td title="${esc(m.phraseList.join(", "))}">${t.phrasesOwn ? `${m.phrases} of ${t.phrases.length}` : t.phrases.length ? m.phrases : "—"}</td>`
+      + `<td title="${esc(m.gramList.join(", "))}">${m.gramOn ? `${m.gramUses}${m.gramUses ? ` <span class="muted">(${m.gramTypes} kinds)</span>` : ""}` : "—"}</td>`;
+    const cells = isSp
+      ? `<td>${date}</td><td>${t.ex.pair ? `pair${r.partner ? ` with ${esc(r.partner)}` : ""}` : "alone"}</td><td>${m.total ? mmss(m.speech) + " / " + mmss(m.total) : "—"}</td><td>${m.words}</td><td>${m.wpm || "—"}</td>
+         <td>${m.pauses !== null ? `${m.pauses} <span class="muted">(${fmtV(m.pausesPerMin)}/min)</span>` : "—"}</td><td>${errCell(m)}</td>${ph}<td>${Math.round(m.b2plus)}%</td><td>${fmtV(m.mattr, "mattr")}</td>`
+      : `<td>${date}</td><td>${m.words}</td><td>${m.sentLen}</td><td>${m.subPer100}</td><td>${errCell(m)}</td>${ph}<td>${Math.round(m.b2plus)}%</td><td>${fmtV(m.mattr, "mattr")}</td>`;
+    return `<tr><td><b>${esc(t.num)}</b> ${esc(t.title)} ${tagOf(t)}</td>${cells}</tr>
+      <tr class="spk-text"><td colspan="${cols.length}"><details ${O.student ? "open" : ""}><summary>Text${m.phraseList.length ? ` · phrases: ${esc(m.phraseList.join(", "))}` : ""}</summary><p>${esc(r.text)}</p></details></td></tr>`;
+  };
+  const cards = shown.map((st) => {
+    const rows = tasks.map((t) => by.get(st.uid + "|" + t.key)).filter(Boolean);
+    const what = isSp ? (rows.length === 1 ? "recording" : "recordings") : rows.length === 1 ? "text" : "texts";
+    return `<section class="card spk-card"><h3>${esc(st.name)} <span class="muted" style="font-weight:400;font-size:14px">${rows.length} ${what}</span></h3>
+      ${rows.length ? firstLast(rows) + `<div class="tscroll"><table class="t spk-t"><thead><tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>${rows.map(row).join("")}</tbody></table></div>`
+        : `<p class="muted">No ${isSp ? "recordings turned into text" : "texts"} yet.</p>`}</section>`;
+  }).join("");
+
+  return head + controls + help + detail
+    + `<h3 class="prog-h">${esc(M.label)}: ${O.student ? `${esc(shown[0]?.name || "")} and the group mean` : "the whole group"}</h3>`
+    + progressChart(tasks, series, mean, M, !!O.student) + table + legend + compare
+    + `<h3 class="prog-h">${O.student ? "Texts and figures" : "Each student: texts and figures"}</h3>` + cards;
+}
+
+function progressCSV() {
+  if (!T.prog?.rows) return;
+  const g = group();
+  const uids = [...new Set([...T.students.map((s) => s.uid), ...T.prog.rows.map((r) => r.uid)])];
+  const code = Object.fromEntries(uids.map((u, i) => [u, "S" + String(i + 1).padStart(2, "0")]));
+  const nameOf = Object.fromEntries(T.students.map((s) => [s.uid, s.name]));
+  const taskOf = Object.fromEntries(T.prog.tasks.map((t, i) => [t.key, { t, i }]));
+  const taskNo = {};
+  for (const sk of ["speaking", "writing"]) T.prog.tasks.filter((t) => t.skill === sk).forEach((t, i) => (taskNo[t.key] = i + 1));
+  const rows = [...T.prog.rows].sort((a, b) => a.skill.localeCompare(b.skill) || (code[a.uid] || "").localeCompare(code[b.uid] || "") || taskOf[a.key].i - taskOf[b.key].i).map((r) => {
+    const { t } = taskOf[r.key], m = r.m;
+    return { code: code[r.uid], student: nameOf[r.uid] || "", group: g?.name || "", skill: r.skill, unit: t.unitNo, task_no: taskNo[r.key], exercise: t.num || t.ex.id,
+      task_title: t.title, setting: { class: "in-class", home: "home" }[g?.plan?.[t.unitId]?.[t.ex.id]?.as] || "", pair: t.ex.pair ? "yes" : "no", partner: r.partner, date: r.at ? new Date(r.at).toISOString().slice(0, 10) : "", submitted: r.status === "submitted" ? "yes" : "no",
+      words: m.words, speech_s: m.speech || "", recording_s: m.total || "", wpm: m.wpm ?? "", pauses: m.pauses ?? "", pauses_per_min: m.pausesPerMin ?? "", longest_pause_s: m.longest ?? "",
+      ttr: m.ttr, mattr50: m.mattr, b2plus_pct: m.b2plus, c1plus_pct: m.c1plus, phrases: m.phrases, phrase_list: m.phraseList.join("; "),
+      grammar_uses: m.gramUses ?? "", grammar_per100: m.gramPer100 ?? "", grammar_types: m.gramTypes ?? "", grammar_list: m.gramList.join("; "), vocab_level: m.level,
+      words_per_sentence: m.sentLen, subordinators_per100: m.subPer100, lt_checked: m.ltChecked ? "yes" : "no", lt_issues_all: m.ltAll ?? "", lt_grammar: m.ltGrammar ?? "",
+      errors_per100: m.errPer100 ?? "", text: r.text, text_at_check: m.checkedText };
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([toCSV(rows)], { type: "text/csv;charset=utf-8" }));
+  a.download = `${COURSE_TITLE.replace(/[^\w]+/g, "-")}_${(g?.name || "group").replace(/[^\w]+/g, "-")}_progress_${todayISO()}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+document.addEventListener("change", (e) => {
+  if (e.target.id === "prog-metric") { const sk = e.target.dataset.skill; T.progOpt.metric[sk] = e.target.value; ls.set("progM:" + sk, e.target.value); render(true); }
+  if (e.target.id === "prog-student") { T.progOpt.student = e.target.value; T.progOpt.open = null; render(true); }
+});
 
 // ================================================================== Access & results
 function viewAccess() {
@@ -690,7 +1009,7 @@ function viewAccess() {
 
 document.addEventListener("change", (e) => {
   if (e.target.id === "show-correct") { T.showCorrect = e.target.checked; ls.set("showCorrect", T.showCorrect ? "1" : "0"); }
-  if (e.target.id === "inc-drafts") { T.includeDrafts = e.target.checked; render(true); }
+  if (e.target.id === "stats-submitted") { T.statsOnlySubmitted = e.target.checked; render(true); }
   if (e.target.id === "g-filter") { T.groupFilter = e.target.value; render(true); }
   if (e.target.matches("select[data-move]")) guard(async () => {
     await updateDoc(doc(db, "users", e.target.dataset.move), { groupId: e.target.value });
@@ -716,6 +1035,12 @@ document.addEventListener("click", (e) => {
     "release": () => releaseUnit(T.gid, u),
     "check-ex": () => checkExercise(T.gid, u, b.dataset.ex),
     "check-writing": () => checkWriting(T.gid, u, b.dataset.ex),
+    "prog-reload": () => { T.prog = null; T.progOpt.open = null; render(true); },
+    "prog-csv": () => progressCSV(b.dataset.skill),
+    "prog-open": () => { T.progOpt.open = { uid: b.dataset.uid, key: b.dataset.key }; render(true); setTimeout(() => $("#prog-detail")?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 30); },
+    "prog-close": () => { T.progOpt.open = null; render(true); },
+    "prog-set": () => { T.progOpt.setting = b.dataset.set || ""; ls.set("progSet", T.progOpt.setting); T.progOpt.open = null; render(true); },
+    "prog-student": () => { T.progOpt.student = b.dataset.uid || ""; T.progOpt.open = null; render(true); },
     "hide-writing": () => guard(async () => updateDoc(doc(db, "groups", T.gid), { [`feedbackEx.${u}`]: arrayRemove(b.dataset.ex) })),
     "uncheck-ex": () => guard(async () => {
       if (!confirm("Hide the results of this exercise from the students? They will be able to change their answers again.")) return;
@@ -742,6 +1067,9 @@ document.addEventListener("click", (e) => {
       document.querySelectorAll(`[data-mi="${CSS.escape(id)}"]`).forEach((el) => (el.hidden = !T.mistOpen.has(id)));
     },
     "practice-clear": () => { delete T.practice[u]; render(true); },
+    "view-as": () => setViewAs(b.dataset.uid),
+    // Analytics: open the unit with this student's answers
+    "view-unit-as": () => { T.viewAs = b.dataset.uid; location.hash = `#${T.unitId}`; },
     "lesson-add": () => addLesson(),
     "lesson-del": () => deleteLesson(b.dataset.date),
     "att": () => toggleAbsent(b.dataset.date, b.dataset.uid),
@@ -804,7 +1132,7 @@ function viewWorks() {
   const subBy = Object.fromEntries(T.subs.map((s) => [s.uid, s]));
   const exs = exercisesOf(data.content);
   const totalItems = exs.reduce((n, ex) => n + (ex.items || []).length, 0);
-  const openTotal = exs.filter((ex) => !isAuto(ex)).reduce((n, ex) => n + ex.items.length, 0);
+  const openTotal = exs.filter((ex) => !isAuto(ex)).reduce((n, ex) => n + ex.items.filter((it) => !it.plain).length, 0);
   const rows = T.students.map((st) => {
     const s = subBy[st.uid], r = T.results[st.uid];
     const filled = s ? exs.reduce((n, ex) => n + (ex.items || []).filter((it) => String(s.answers?.[ex.id]?.[it.id] ?? "").trim()).length, 0) : 0;
@@ -855,6 +1183,7 @@ function studentDetail(uid, data) {
     return `<h3>${n}.${i + 1} ${esc(sec.title)}</h3>` + exs.map((ex, j) => renderExercise(ex, {
       num: `${n}.${i + 1}.${j + 1}`,
       answers: sub.answers?.[ex.id] || {},
+      speech: sub.answers?._speech?.[ex.id],
       readOnly: true,
       auto: isAuto(ex) ? auto.items[ex.id] : undefined,
       factor: f[ex.id],
@@ -863,7 +1192,16 @@ function studentDetail(uid, data) {
       itemExtra: T.exr?.[uid]?.feedback?.[ex.id] ? (itemId) => feedbackHTML(T.exr[uid].feedback[ex.id][itemId], { checkedAt: fmtTime(T.exr[uid].feedbackAt?.[ex.id]) }) : null,
     })).join("");
   }).join("");
+  // switching between students without going back to the table
+  const withWork = T.students.filter((x) => T.subs.some((s) => s.uid === x.uid));
+  const k = withWork.findIndex((x) => x.uid === uid), pv = withWork[k - 1], nx = withWork[k + 1];
+  const switcher = `<div class="viewas-bar on" style="margin:0 0 12px">
+      <button class="btn small" data-act="select-student" data-uid="${esc(pv?.uid || "")}" ${pv ? "" : "disabled"} title="Previous student">Previous</button>
+      <select id="works-student">${withWork.map((x) => `<option value="${esc(x.uid)}" ${x.uid === uid ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>
+      <button class="btn small" data-act="select-student" data-uid="${esc(nx?.uid || "")}" ${nx ? "" : "disabled"} title="Next student">Next</button>
+      <span class="muted" style="font-size:13px">${k + 1} of ${withWork.length} students with work in this unit</span></div>`;
   return `<div class="box">
+    ${switcher}
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">${esc(st.name)} <span class="muted" style="font-size:16px">· auto-checked ${Object.keys(f).length ? adjustedAuto(auto, f) : auto.score}/${auto.max}</span></h2>
       <div class="row">
@@ -898,74 +1236,94 @@ async function saveGrades(uid) {
 }
 
 // ================================================================== Analytics
+// Students work exercise by exercise and seldom submit a whole unit, so all their answers count here
+// (drafts included); a student is counted in an exercise once they have answered at least one of its questions.
+// The tick "only units submitted as a whole" gives the old, stricter view.
 function viewStats() {
   const g = group(), u = unit();
   const head = pageHead("Teaching tools", "Analytics",
     g && u ? `Unit ${unitNum(u)} · ${esc(u.title)} — group ${esc(g.name)}` : "")
-    + `<label class="row"><input type="checkbox" id="inc-drafts" ${T.includeDrafts ? "checked" : ""}> include drafts that have not been submitted</label>`;
+    + `<label class="row"><input type="checkbox" id="stats-submitted" ${T.statsOnlySubmitted ? "checked" : ""}> only units submitted as a whole</label>`;
   if (!g || !u) return head + `<div class="box">Choose a group and a unit at the top of the page.</div>`;
   const data = T.unitData[u.id];
   if (!data?.content) return head + `<p class="muted">No data.</p>`;
-  const subs = T.subs.filter((s) => s.status === "submitted" || T.includeDrafts);
-  const exs = exercisesOf(data.content);
+  const inGroup = new Set(T.students.map((s) => s.uid));
+  const subs = T.subs.filter((s) => inGroup.has(s.uid) && (!T.statsOnlySubmitted || s.status === "submitted"));
   const nameOf = Object.fromEntries(T.students.map((s) => [s.uid, s.name]));
-  if (!subs.length) return head + `<div class="box">No ${T.includeDrafts ? "work" : "submitted work"} yet.</div>`;
+  const autoEx = exercisesOf(data.content).filter((ex) => isAuto(ex) && ex.items?.length);
+  const nums = exerciseNumbers(data.content, unitNum(u));
+  const started = (s, ex) => (ex.items || []).some((it) => String(s.answers?.[ex.id]?.[it.id] ?? "").trim());
+  if (!subs.length) return head + `<div class="box">${T.statsOnlySubmitted ? "No student has submitted this unit as a whole yet. Untick the box to see all answers." : "No student has answered anything in this unit yet."}</div>`;
 
-  // per question
+  // per student and exercise: only the exercises the student has started
+  const perStudent = subs.map((s) => {
+    const byEx = {}; let score = 0, max = 0, nEx = 0;
+    for (const ex of autoEx) {
+      if (!started(s, ex)) { byEx[ex.id] = null; continue; }
+      const r = gradeExercise(ex, s.answers?.[ex.id] || {}, data.keys?.[ex.id] || {});
+      const n = ex.items.length;
+      byEx[ex.id] = { pct: Math.round((100 * r.score) / n), items: r.items };
+      score += r.score; max += n; nEx++;
+    }
+    return { s, byEx, score, max, nEx, pct: max ? Math.round((100 * score) / max) : null };
+  });
+  const active = perStudent.filter((p) => p.nEx);
+  if (!active.length) return head + `<div class="box">Students have answered only open questions so far: there is nothing to check against the keys yet. Open answers are in <a href="#tools/works">Student work</a> and on the Progress pages.</div>`;
+  active.sort((x, y) => x.pct - y.pct);
+
+  // per question, among the students who started the exercise
   const items = [];
-  for (const ex of exs) {
-    if (!isAuto(ex)) continue;
+  for (const ex of autoEx) {
+    const who = active.filter((p) => p.byEx[ex.id]);
+    if (!who.length) continue;
     for (const it of ex.items) {
-      const key = data.keys?.[ex.id]?.[it.id];
       let ok = 0; const wrong = {};
-      for (const s of subs) {
-        const given = s.answers?.[ex.id]?.[it.id] ?? "";
-        if (norm(given) && (Array.isArray(key) ? key : [key]).some((k) => norm(k) === norm(given))) ok++;
-        else { const w = norm(given) || "(blank)"; wrong[w] = (wrong[w] || 0) + 1; }
+      for (const p of who) {
+        const r = p.byEx[ex.id].items[it.id];
+        if (r?.ok) ok++;
+        else { const w = norm(r?.given ?? "") || "(blank)"; wrong[w] = (wrong[w] || 0) + 1; }
       }
-      items.push({ ex, it, key, ok, n: subs.length, pct: Math.round((100 * ok) / subs.length), wrong: Object.entries(wrong).sort((a, b) => b[1] - a[1]) });
+      items.push({ ex, it, key: data.keys?.[ex.id]?.[it.id], ok, n: who.length, pct: Math.round((100 * ok) / who.length), wrong: Object.entries(wrong).sort((a, b) => b[1] - a[1]) });
     }
   }
-  // per student and exercise
-  const perStudent = subs.map((s) => {
-    const a = gradeAuto(data.content, s.answers, data.keys);
-    const byEx = {};
-    for (const ex of exs) if (isAuto(ex)) {
-      const v = Object.values(a.items[ex.id] || {});
-      byEx[ex.id] = v.length ? Math.round((100 * v.filter((x) => x.ok).length) / v.length) : null;
-    }
-    return { s, a, byEx, pct: a.max ? Math.round((100 * a.score) / a.max) : 0 };
-  }).sort((x, y) => x.pct - y.pct);
-  const avg = Math.round(perStudent.reduce((n, p) => n + p.pct, 0) / perStudent.length);
-  const autoEx = exs.filter(isAuto);
-  const openItems = exs.filter((ex) => !isAuto(ex)).reduce((n, ex) => n + ex.items.length, 0);
-  const graded = Object.values(T.results).reduce((n, r) => n + (openItems - (r.manualPending ?? openItems)), 0);
+  const avg = Math.round(active.reduce((n, p) => n + p.pct, 0) / active.length);
+  const exUsed = autoEx.filter((ex) => active.some((p) => p.byEx[ex.id]));
+  const exPct = Object.fromEntries(exUsed.map((ex) => { const v = active.map((p) => p.byEx[ex.id]?.pct).filter((x) => x !== undefined); return [ex.id, Math.round(v.reduce((a, b) => a + b, 0) / v.length)]; }));
+  const hardestEx = [...exUsed].sort((a, b) => exPct[a.id] - exPct[b.id])[0];
+  // a question counts as "difficult" only when enough students have answered it
+  const minN = Math.min(3, Math.max(...items.map((x) => x.n)));
+  const hardest = items.filter((x) => x.n >= minN).sort((a, b) => a.pct - b.pct || b.n - a.n).slice(0, 10);
+  const openEx = exercisesOf(data.content).filter((ex) => isManual(ex));
+  const openItems = openEx.reduce((n, ex) => n + ex.items.filter((it) => !it.plain).length, 0);
+  const openAnswered = subs.reduce((n, s) => n + openEx.reduce((m, ex) => m + ex.items.filter((it) => !it.plain && String(s.answers?.[ex.id]?.[it.id] ?? "").trim()).length, 0), 0);
 
   const wrongHTML = (w) => w.slice(0, 3).map(([ans, c]) => `“${esc(ans)}” ×${c}`).join(", ");
   const itemRow = (x) => `<tr>
-      <td>${esc(x.ex.title)}<br><small class="muted">${esc(KIND_LABEL[x.ex.kind])}</small></td>
-      <td>${esc(x.it.id)}. ${x.it.text.replace("___", "_____").replace(/<[^>]*>/g, "").slice(0, 90)}</td>
+      <td><b>${esc(nums[x.ex.id] || "")}</b> ${esc(x.ex.title)}<br><small class="muted">${esc(KIND_LABEL[x.ex.kind])}</small></td>
+      <td>${esc(x.it.id)}. ${String(x.it.text || "").replace("___", "_____").replace(/<[^>]*>/g, "").slice(0, 90)}</td>
       <td><span class="keyhint" style="margin:0">${esc(keyText(x.key))}</span></td>
-      <td class="num">${x.pct}%<div class="bar"><i style="width:${x.pct}%;background:${heat(x.pct)}"></i></div></td>
+      <td class="num">${x.pct}% <small class="muted">of ${x.n}</small><div class="bar"><i style="width:${x.pct}%;background:${heat(x.pct)}"></i></div></td>
       <td class="wrong-list">${wrongHTML(x.wrong)}</td></tr>`;
-  const hardest = [...items].sort((a, b) => a.pct - b.pct).slice(0, 10);
 
   return head + `
+    <p class="muted">Drafts are included: a student is counted in an exercise as soon as they have answered at least one of its questions. Open answers (translations, sentences, letters) are not checked against keys and are not in these figures.</p>
     <div class="cards">
-      <div class="card"><b>${subs.length} / ${T.students.length}</b><span>pieces of work / students</span></div>
-      <div class="card"><b>${avg}%</b><span>average auto-checked score</span></div>
-      <div class="card"><b>${hardest[0] ? hardest[0].pct + "%" : "—"}</b><span>most difficult question</span></div>
-      ${openItems ? `<div class="card"><b>${graded} / ${openItems * subs.length}</b><span>open answers marked</span></div>` : ""}
+      <div class="card"><b>${active.length} / ${T.students.length}</b><span>students with answers to check</span></div>
+      <div class="card"><b>${avg}%</b><span>average score in the exercises they did</span></div>
+      <div class="card"><b>${hardestEx ? exPct[hardestEx.id] + "%" : "—"}</b><span>most difficult exercise${hardestEx ? `: ${esc(nums[hardestEx.id] || "")} ${esc(hardestEx.title)}` : ""}</span></div>
+      ${openItems ? `<div class="card"><b>${openAnswered}</b><span>open answers written</span></div>` : ""}
     </div>
     <h3>Questions students found most difficult</h3>
     <table class="t"><tr><th>Exercise</th><th>Question</th><th>Key</th><th>Correct</th><th>Most common mistakes</th></tr>${hardest.map(itemRow).join("")}</table>
 
     <h3>Results by student and exercise</h3>
-    <div style="overflow-x:auto"><table class="t"><tr><th>Student</th><th>Total</th>${autoEx.map((ex) => `<th title="${esc(ex.title)}">${esc(ex.title.slice(0, 22))}</th>`).join("")}<th></th></tr>
-    ${perStudent.map((p) => `<tr><td>${esc(nameOf[p.s.uid] || p.s.uid)}${p.s.status !== "submitted" ? ` <span class="pill warn">draft</span>` : ""}</td>
-      <td class="num"><b>${p.a.score}/${p.a.max}</b> (${p.pct}%)</td>
-      ${autoEx.map((ex) => `<td class="heat" style="background:${heat(p.byEx[ex.id], true)}">${p.byEx[ex.id] ?? "—"}%</td>`).join("")}
-      <td><button class="btn small" data-act="select-student" data-uid="${esc(p.s.uid)}">Answers</button></td></tr>`).join("")}
+    <p class="muted" style="font-size:13px">“—” – the student has not started the exercise. The total counts only the exercises the student has started.</p>
+    <div class="tscroll"><table class="t stats-t"><tr><th>Student</th><th>Total</th>${exUsed.map((ex) => `<th title="${esc(ex.title)}">${esc(nums[ex.id] || ex.title.slice(0, 10))}</th>`).join("")}<th></th></tr>
+    <tr class="muted"><td><i>Group</i></td><td class="num"><b>${avg}%</b></td>${exUsed.map((ex) => `<td class="heat num" style="background:${heat(exPct[ex.id], true)}"><b>${exPct[ex.id]}%</b></td>`).join("")}<td></td></tr>
+    ${active.map((p) => `<tr><td>${esc(nameOf[p.s.uid] || p.s.uid)}${p.s.status === "submitted" ? ` <span class="pill on">submitted</span>` : ""}</td>
+      <td class="num"><b>${p.score}/${p.max}</b> (${p.pct}%)</td>
+      ${exUsed.map((ex) => { const c = p.byEx[ex.id]; return `<td class="heat num" style="background:${heat(c?.pct, true)}">${c ? c.pct + "%" : "—"}</td>`; }).join("")}
+      <td><button class="btn small" data-act="view-unit-as" data-uid="${esc(p.s.uid)}" title="Open the unit with this student's answers">Answers</button></td></tr>`).join("")}
     </table></div>
 
     <details><summary>All questions in order (${items.length})</summary>
@@ -1050,7 +1408,7 @@ function splitUnit(u) {
     }
     return { id: s.id, title: s.title, ...(s.subtitle ? { subtitle: s.subtitle } : {}), blocks };
   });
-  return { meta, content: { sections }, tests, keys: { exercises: keys, notes, tests: testKeys } };
+  return { meta, content: { sections, ...(Array.isArray(u.grammar) ? { grammar: u.grammar } : {}) }, tests, keys: { exercises: keys, notes, tests: testKeys } };
 }
 
 function setImportStatus(html) {
@@ -1082,7 +1440,8 @@ async function importCourse() {
     await batch.commit();
     for (const l of list) delete T.unitData[l.id];
     T.testsLoaded = false;
-    $("#import-text").value = "";
+    // the page may already have been redrawn by the database update: the field can be gone
+    const ta = $("#import-text"); if (ta) ta.value = "";
     const summary = parts.filter((p) => p.content).map((p, i) => {
       const u = list[parts.indexOf(p)];
       const nEx = p.content.sections.reduce((n, sec) => n + sec.blocks.filter((b) => b.type === "exercise" || b.numbered).length, 0);
@@ -1322,184 +1681,3 @@ async function releaseTest(key) {
     toast(`Checked: ${atts.length}. Students can see their results now.`);
   });
 }
-
-// ================================================================== Progress: speaking and writing over time
-// For research: each student's recorded answers (transcripts) and tracked written texts, measured task by task.
-// Data: submissions (texts, sent with Done) + exerciseResults (LanguageTool check) of the current group.
-T.prog = null;
-T.progOpt = { skill: ls.get("progSkill", "speaking"), metric: ls.get("progMetric", "words"), open: null };
-
-async function loadProgress() {
-  const gid = T.gid;
-  if (!gid) return;
-  T.prog = { gid, loading: true };
-  try {
-    const units = T.units.filter((u) => u.status !== "soon");
-    const [V, subsSnap, exrSnap] = await Promise.all([
-      loadVocab(),
-      getDocs(query(collection(db, "submissions"), where("groupId", "==", gid))),
-      getDocs(query(collection(db, "exerciseResults"), where("groupId", "==", gid))),
-    ]);
-    const content = {};
-    for (const u of units) content[u.id] = (await loadUnitData(u.id)).content;
-    const tasks = trackedTasks(units, content).map((t) => ({ ...t, num: exerciseNumbers(content[t.unitId], unitNum(T.units.find((u) => u.id === t.unitId)))[t.exId] }));
-    const phrases = Object.fromEntries(units.map((u) => [u.id, unitVocabulary(content[u.id])]));
-    const exr = {};
-    exrSnap.docs.forEach((d) => { const r = d.data(); exr[r.unitId + "|" + r.uid] = r; });
-    const rows = [];
-    for (const d of subsSnap.docs) {
-      const s = d.data();
-      for (const t of tasks) {
-        if (t.unitId !== s.unitId) continue;
-        const text = s.answers?.[t.exId]?.[t.itemId];
-        if (!String(text || "").trim()) continue;
-        const fb = exr[s.unitId + "|" + s.uid]?.feedback?.[t.exId]?.[t.itemId];
-        rows.push({ uid: s.uid, key: t.key, text: String(text), status: s.status, updatedAt: s.updatedAt,
-          m: measure(text, V, phrases[t.unitId], fb, s.answers?.[t.exId]?.[t.itemId + "~m"]) });
-      }
-    }
-    T.prog = { gid, tasks, rows, at: new Date() };
-  } catch (e) {
-    console.error(e);
-    T.prog = { gid, error: friendlyError(e) };
-  }
-  if (route().tool === "progress") render(true);
-}
-
-const fmtV = (v, id) => (v === null || v === undefined || Number.isNaN(v) ? "–" : id === "mattr" ? Number(v).toFixed(2) : String(v));
-
-function sparkline(vals, dir) {
-  const pts = vals.map((v, i) => [i, v]).filter(([, v]) => typeof v === "number");
-  if (pts.length < 2) return "";
-  const W = 90, H = 24, xs = vals.length - 1 || 1;
-  const lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1])), span = hi - lo || 1;
-  const P = pts.map(([i, v]) => `${(4 + (i / xs) * (W - 8)).toFixed(1)},${(H - 4 - ((v - lo) / span) * (H - 8)).toFixed(1)}`);
-  const up = (pts[pts.length - 1][1] - pts[0][1]) * dir >= 0;
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true"><polyline points="${P.join(" ")}" fill="none" stroke="var(${up ? "--ok" : "--bad"})" stroke-width="1.8"/>${P.map((p) => `<circle cx="${p.split(",")[0]}" cy="${p.split(",")[1]}" r="1.8" fill="var(${up ? "--ok" : "--bad"})"/>`).join("")}</svg>`;
-}
-
-function progressChart(tasks, series, mean, M) {
-  const all = [...series.flatMap((s) => s.vals), ...mean].filter((v) => typeof v === "number");
-  if (!all.length || tasks.length < 2) return "";
-  const W = 640, H = 220, L = 44, R = 12, Tp = 14, B = 34;
-  const lo = Math.min(0, ...all), hi = Math.max(...all) || 1;
-  const x = (i) => L + (i / (tasks.length - 1)) * (W - L - R);
-  const y = (v) => Tp + (1 - (v - lo) / (hi - lo || 1)) * (H - Tp - B);
-  const line = (vals) => { const p = vals.map((v, i) => (typeof v === "number" ? `${x(i).toFixed(1)},${y(v).toFixed(1)}` : null)).filter(Boolean); return p.length > 1 ? p.join(" ") : ""; };
-  const ticks = [lo, (lo + hi) / 2, hi].map((v) => `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" class="ax">${fmtV(Math.round(v * 100) / 100, M.id)}</text><line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" class="grid"/>`).join("");
-  const xl = tasks.map((t, i) => `<text x="${x(i)}" y="${H - 12}" text-anchor="middle" class="ax">T${i + 1}</text>`).join("");
-  const st = series.map((s) => { const p = line(s.vals); return p ? `<polyline points="${p}" class="st"><title>${esc(s.name)}</title></polyline>` : ""; }).join("");
-  const mp = line(mean);
-  const md = mean.map((v, i) => (typeof v === "number" ? `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" class="mn"><title>T${i + 1}: group mean ${fmtV(v, M.id)}</title></circle>` : "")).join("");
-  return `<figure class="prog-chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(M.label)}: group mean by task">${ticks}${xl}${st}${mp ? `<polyline points="${mp}" class="mn"/>` : ""}${md}</svg>
-    <figcaption><span class="lg mn"></span> group mean &nbsp; <span class="lg st"></span> individual students (hover for the name)</figcaption></figure>`;
-}
-
-function viewProgress() {
-  const g = group();
-  const head = pageHead("Teaching tools", "Progress",
-    "How each student's speaking and writing change from task to task. Speaking: recorded answers turned into text in the student's browser (Whisper). "
-    + "Writing: texts in exercises marked for tracking. Error counts appear after you click <b>Check the speaking now</b> or <b>Check the writing now</b> above the exercise.");
-  if (!g) return head + `<div class="box">First create a group in <a href="#tools/groups">Groups &amp; students</a>.</div>`;
-  if (!T.prog || T.prog.gid !== T.gid) { loadProgress(); return head + `<p class="muted">Loading the texts of group ${esc(g.name)}…</p>`; }
-  if (T.prog.loading) return head + `<p class="muted">Loading the texts of group ${esc(g.name)}…</p>`;
-  if (T.prog.error) return head + `<div class="box">The data could not be loaded: ${esc(T.prog.error)} <button class="btn small" data-act="prog-reload">Try again</button></div>`;
-  const O = T.progOpt;
-  const tasks = T.prog.tasks.filter((t) => t.skill === O.skill);
-  const metrics = METRICS.filter((m) => !m.skill || m.skill === O.skill);
-  const M = metrics.find((m) => m.id === O.metric) || metrics[0];
-  const by = new Map(T.prog.rows.map((r) => [r.uid + "|" + r.key, r]));
-  const studs = T.students;
-  const val = (uid, t) => { const r = by.get(uid + "|" + t.key); return r ? r.m[M.id] : undefined; };
-  const series = studs.map((s) => ({ name: s.name, uid: s.uid, vals: tasks.map((t) => val(s.uid, t)) }));
-  const mean = tasks.map((t, i) => { const v = series.map((s) => s.vals[i]).filter((x) => typeof x === "number"); return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 100) / 100 : null; });
-  const counts = tasks.map((t, i) => series.filter((s) => typeof s.vals[i] === "number").length);
-
-  const controls = `<div class="prog-ctl">
-      <span class="seg">${["speaking", "writing"].map((k) => `<button class="${O.skill === k ? "on" : ""}" data-act="prog-skill" data-skill="${k}">${k === "speaking" ? "Speaking" : "Writing"}</button>`).join("")}</span>
-      <label>Measure <select id="prog-metric">${metrics.map((m) => `<option value="${m.id}" ${m.id === M.id ? "selected" : ""}>${esc(m.label)}</option>`).join("")}</select></label>
-      <span style="flex:1"></span>
-      <button class="btn small" data-act="prog-reload">Refresh</button>
-      <button class="btn small primary" data-act="prog-csv">Download all data (.csv)</button>
-    </div>`;
-  if (!tasks.length) return head + controls + `<div class="box">There are no ${O.skill === "speaking" ? "recorded speaking tasks" : "tracked writing tasks"} in the open units yet.</div>`;
-
-  const taskHead = tasks.map((t, i) => `<th title="${esc(`${t.num || ""} ${t.title} – ${t.prompt}`)}">T${i + 1}<span class="s">${esc(t.num || "")}${t.itemId !== "1" || tasks.filter((x) => x.exId === t.exId && x.unitId === t.unitId).length > 1 ? "·" + esc(t.itemId) : ""}</span></th>`).join("");
-  const rowsHTML = series.map((s) => {
-    const nums = s.vals.filter((v) => typeof v === "number");
-    const change = nums.length > 1 ? Math.round((nums[nums.length - 1] - nums[0]) * 100) / 100 : null;
-    const good = change !== null && change * M.dir > 0, bad = change !== null && change * M.dir < 0;
-    return `<tr><td class="nm">${esc(s.name)}</td>${s.vals.map((v, i) => `<td class="num">${typeof v === "number" ? `<a href="#" data-act="prog-open" data-uid="${esc(s.uid)}" data-key="${esc(tasks[i].key)}">${fmtV(v, M.id)}</a>` : `<span class="muted">–</span>`}</td>`).join("")}
-      <td class="num ${good ? "up" : bad ? "down" : ""}">${change === null ? "–" : (change > 0 ? "+" : "") + fmtV(change, M.id)}</td><td>${sparkline(s.vals, M.dir)}</td></tr>`;
-  }).join("");
-  const table = `<div class="tbl-wrap"><table class="t prog"><thead><tr><th>Student</th>${taskHead}<th>Change</th><th>Trend</th></tr></thead>
-    <tbody>${rowsHTML}</tbody>
-    <tfoot><tr><td><b>Group mean</b></td>${mean.map((v) => `<td class="num"><b>${fmtV(v, M.id)}</b></td>`).join("")}<td></td><td>${sparkline(mean, M.dir)}</td></tr>
-      <tr><td class="muted">Answers</td>${counts.map((c) => `<td class="num muted">${c}</td>`).join("")}<td></td><td></td></tr></tfoot></table></div>`;
-  const legend = `<ol class="prog-tasks">${tasks.map((t, i) => `<li><b>T${i + 1}</b> · ${esc(t.num || "")} ${esc(t.title)}${t.sec ? ` · ${t.sec} s` : ""} <span class="muted">${esc(t.prompt.slice(0, 110))}${t.prompt.length > 110 ? "…" : ""}</span></li>`).join("")}</ol>`;
-
-  let detail = "";
-  if (O.open) {
-    const r = by.get(O.open.uid + "|" + O.open.key), t = T.prog.tasks.find((x) => x.key === O.open.key);
-    const st = studs.find((x) => x.uid === O.open.uid);
-    if (r && t) {
-      const m = r.m;
-      const facts = [["Words", m.words], ...(t.skill === "speaking" ? [["Recording", m.dur ? `${m.dur} s` : "–"], ["Words a minute", fmtV(m.wpm)], ["Recording number", m.take ?? "–"]] : [["Words per sentence", m.sentLen]]),
-        ["MATTR-50", fmtV(m.mattr, "mattr")], ["TTR", m.ttr], ["B2+ words", m.b2plus + "%"], ["C1+ words", m.c1plus + "%"],
-        ["Unit phrases", `${m.unitPhrases}${m.unitPhraseList ? ` (${esc(m.unitPhraseList)})` : ""}`], ["Subordinating words / 100", m.subPer100],
-        ["LanguageTool", m.ltChecked ? `${m.ltAll} issues, ${m.ltGrammar} grammar · ${m.errPer100} errors per 100 words` : "not checked yet"]];
-      detail = `<div class="box prog-detail" id="prog-detail"><div class="row" style="justify-content:space-between"><b>${esc(st?.name || "")} · T${tasks.indexOf(t) + 1} · ${esc(t.num || "")} ${esc(t.title)}</b>
-        <button class="btn small" data-act="prog-close">Close</button></div>
-        <p class="muted">${esc(t.prompt)}</p>
-        <div class="prog-text">${esc(r.text)}</div>
-        ${m.checkedText && m.checkedText !== r.text ? `<details><summary>Text at the time of the check</summary><div class="prog-text">${esc(m.checkedText)}</div></details>` : ""}
-        <dl class="prog-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl></div>`;
-    }
-  }
-  return head + controls + detail + progressChart(tasks, series, mean, M) + table + legend
-    + `<p class="muted" style="font-size:13px">Measures: MATTR-50 – moving-average type–token ratio over 50-word windows (Covington &amp; McFall, 2010); B2+ – share of words from CEFR-J (A1–B2) and Octanove (C1–C2) lists at B2 or above;
-      subordinating words – <i>because, although, which, who, when, if…</i> per 100 words; errors – LanguageTool issues except punctuation and style, per 100 words.
-      Whisper tends to smooth out hesitations and some slips, so speaking accuracy is somewhat overestimated; compare a sample of transcripts with the recordings before publishing.
-      Loaded ${fmtTime(T.prog.at)}.</p>`;
-}
-
-function progressCSV() {
-  if (!T.prog?.rows) return;
-  const g = group();
-  const uids = [...new Set([...T.students.map((s) => s.uid), ...T.prog.rows.map((r) => r.uid)])];
-  const code = Object.fromEntries(uids.map((u, i) => [u, "S" + String(i + 1).padStart(2, "0")]));
-  const nameOf = Object.fromEntries(T.students.map((s) => [s.uid, s.name]));
-  const order = Object.fromEntries(T.prog.tasks.map((t, i) => [t.key, i]));
-  const taskNo = {};
-  for (const sk of ["speaking", "writing"]) T.prog.tasks.filter((t) => t.skill === sk).forEach((t, i) => (taskNo[t.key] = i + 1));
-  const rows = [...T.prog.rows].sort((a, b) => (code[a.uid] || "").localeCompare(code[b.uid] || "") || order[a.key] - order[b.key]).map((r) => {
-    const t = T.prog.tasks.find((x) => x.key === r.key), m = r.m;
-    return { code: code[r.uid], student: nameOf[r.uid] || "", group: g?.name || "", skill: t.skill, unit: t.unitOrder, task_no: taskNo[t.key], exercise: t.num || t.exId, item: t.itemId,
-      task_title: t.title, recorded_at: m.recordedAt, submitted: r.status === "submitted" ? "yes" : "no",
-      words: m.words, duration_s: m.dur || "", wpm: m.wpm ?? "", take: m.take ?? "", ttr: m.ttr, mattr50: m.mattr, b2plus_pct: m.b2plus, c1plus_pct: m.c1plus,
-      unit_phrases: m.unitPhrases, unit_phrase_list: m.unitPhraseList, words_per_sentence: m.sentLen, subordinators_per100: m.subPer100,
-      lt_checked: m.ltChecked ? "yes" : "no", lt_issues_all: m.ltAll ?? "", lt_grammar: m.ltGrammar ?? "", errors_per100: m.errPer100 ?? "", text: r.text, text_at_check: m.checkedText };
-  });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([toCSV(rows)], { type: "text/csv;charset=utf-8" }));
-  a.download = `${COURSE_TITLE.replace(/[^\w]+/g, "-")}_${(g?.name || "group").replace(/[^\w]+/g, "-")}_progress_${todayISO()}.csv`;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-}
-
-document.addEventListener("click", (e) => {
-  const b = e.target.closest?.("[data-act^='prog-']");
-  if (!b) return;
-  e.preventDefault();
-  const O = T.progOpt;
-  const act = b.dataset.act;
-  if (act === "prog-skill") { O.skill = b.dataset.skill; ls.set("progSkill", O.skill); O.open = null; render(true); }
-  if (act === "prog-reload") { T.prog = null; O.open = null; render(true); }
-  if (act === "prog-csv") progressCSV();
-  if (act === "prog-open") { O.open = { uid: b.dataset.uid, key: b.dataset.key }; render(true); setTimeout(() => $("#prog-detail")?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 30); }
-  if (act === "prog-close") { O.open = null; render(true); }
-});
-document.addEventListener("change", (e) => {
-  if (e.target.id !== "prog-metric") return;
-  T.progOpt.metric = e.target.value; ls.set("progMetric", e.target.value); render(true);
-});

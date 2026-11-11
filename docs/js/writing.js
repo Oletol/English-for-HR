@@ -2,7 +2,9 @@
 // Octanove C1–C2, Google 10,000 frequency list as a fallback) and use of the unit's vocabulary.
 // The check runs in the teacher's browser when the teacher clicks the button; the result is
 // saved for each student in exerciseResults and shown under their text.
-import { esc } from "./common.js?v=20261029c";
+import { esc } from "./common.js?v=20261111a";
+import { metricsLine } from "./transcribe.js?v=20261111a";
+import { learnerIssues, findGrammar, textLevel } from "./grammar.js?v=20261111a";
 
 const LT_URL = "https://api.languagetool.org/v2/check";
 const LT_LANG = "en-GB";
@@ -85,7 +87,10 @@ export function vocabProfile(text, V, unitPhrases = []) {
 const WILD = new Set(["something", "somebody", "someone", "sb", "sth", "one's"]);
 const DET = new Set(["a", "an", "the", "my", "your", "his", "her", "its", "our", "their", "this", "that", "these", "those", "some", "any"]);
 export function phraseUsed(phrase, toks) {
-  const p = tokens(phrase).map((t) => (WILD.has(t) ? "*" : DET.has(t) ? "?" : new Set(candidates(t))));
+  // the text tokens lose their endings 're, 's, 'll… (see vocabProfile), so the phrase tokens must lose them too:
+  // otherwise "I see where you're coming from" is never found
+  const p = tokens(phrase).map((t) => t.replace(/'(s|t|ll|re|ve|d|m)$/, "")).filter((t) => t && !NOT_WORDS.has(t))
+    .map((t) => (WILD.has(t) ? "*" : DET.has(t) ? "?" : new Set(candidates(t))));
   const sets = toks.map((t) => new Set(candidates(t)));
   const same = (a, b) => [...a].some((x) => b.has(x));
   const match = (i, j) => {
@@ -105,7 +110,8 @@ export function unitVocabulary(content) {
   const out = new Set();
   for (const s of content?.sections || [])
     for (const b of s.blocks || []) {
-      if (b.type === "flashcards") (b.cards || []).forEach((c) => out.add(c.front));
+      // discussion cards are questions, not vocabulary
+      if (b.type === "flashcards" && b.style !== "discussion") (b.cards || []).forEach((c) => out.add(c.front));
       if (Array.isArray(b.vocab)) b.vocab.forEach((v) => out.add(v));
     }
   return [...out];
@@ -138,6 +144,57 @@ export async function grammarCheck(texts) {
 }
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ------------------------------------------------------------------ grammar (Harper, in the teacher's browser)
+// Harper (Automattic, Apache-2.0) is a grammar checker compiled to WebAssembly: it runs on this computer, has no limits
+// and sends nothing anywhere. It finds fewer learner mistakes than LanguageTool but different ones, so both are used.
+let HARPER = null;
+async function harper() {
+  if (!HARPER) HARPER = (async () => {
+    const [{ LocalLinter, Dialect }, { slimBinary }] = await Promise.all([import("./vendor/harper/index.js"), import("./vendor/harper/slimBinary.js")]);
+    const l = new LocalLinter({ binary: slimBinary, dialect: Dialect.British });
+    await l.setup();
+    return l;
+  })().catch((e) => { HARPER = null; throw e; });
+  return HARPER;
+}
+const HARPER_TYPE = { Spelling: "misspelling", Typo: "misspelling", Capitalization: "typographical", Punctuation: "typographical", Formatting: "whitespace",
+  Style: "style", Readability: "style", Enhancement: "style", Regionalism: "style", Redundancy: "style", Repetition: "duplication" };
+async function harperCheck(texts) {
+  const l = await harper();
+  const out = {};
+  for (const [id, t] of Object.entries(texts)) {
+    const lints = await l.lint(String(t || ""));
+    out[id] = lints.map((x) => {
+      const sp = x.span(), kind = x.lint_kind();
+      return { offset: sp.start, length: sp.end - sp.start, message: x.message(), short: "", fix: x.suggestions().slice(0, 3).map((z) => z.get_replacement_text()).filter(Boolean),
+        type: HARPER_TYPE[kind] || "grammar", category: "Harper · " + (x.lint_kind_pretty?.() || kind), src: "harper" };
+    });
+  }
+  return out;
+}
+
+// All three checks together: course rules for typical learner mistakes (always), LanguageTool (online, 20 texts a minute)
+// and Harper (offline). Where two of them mark the same words, the first one is kept: course rules, LanguageTool, Harper.
+export async function checkGrammar(texts) {
+  const parts = Object.fromEntries(Object.entries(texts).filter(([, t]) => String(t || "").trim()));
+  let lt = {}, hp = {}, ltError = false, harperError = false;
+  await Promise.all([
+    grammarCheck(parts).then((r) => { lt = r; }, (e) => { console.warn("LanguageTool", e); ltError = true; }),
+    harperCheck(parts).then((r) => { hp = r; }, (e) => { console.warn("Harper", e); harperError = true; }),
+  ]);
+  const issues = {};
+  for (const [id, t] of Object.entries(parts)) {
+    const all = [...learnerIssues(t), ...(lt[id] || []).map((x) => ({ ...x, src: "lt" })), ...(hp[id] || [])];
+    const kept = [];
+    for (const x of all) if (!kept.some((k) => x.offset < k.offset + k.length && k.offset < x.offset + x.length)) kept.push(x);
+    issues[id] = kept.sort((a, b) => a.offset - b.offset);
+  }
+  return { issues, ltError, harperError };
+}
+
+// The unit's grammar structures used in a text, and the vocabulary level that covers 95% of its words
+export { findGrammar, textLevel };
+
 // ------------------------------------------------------------------ feedback shown under the text
 export function wordCount(text) { return tokens(text).length; }
 
@@ -153,19 +210,26 @@ export function feedbackHTML(fb, { checkedAt } = {}) {
     pos = is.offset + is.length;
   }
   html += esc(text.slice(pos));
-  const issues = (fb.issues || []).map((is) => `<li><b>${esc(text.substr(is.offset, is.length))}</b> – ${esc(is.message)}${is.fix?.length ? ` <span class="fix">Try: ${is.fix.map((f) => `“${esc(f)}”`).join(", ")}</span>` : ""}</li>`).join("");
+  const SRC = { lt: "LanguageTool", harper: "Harper", course: "course rule" };
+  const issues = (fb.issues || []).map((is) => `<li><b>${esc(text.substr(is.offset, is.length))}</b> – ${esc(is.message)}${is.fix?.length ? ` <span class="fix">Try: ${is.fix.map((f) => `“${esc(f)}”`).join(", ")}</span>` : ""}${is.src ? ` <small class="lt-src">${SRC[is.src] || ""}</small>` : ""}</li>`).join("");
+  const gr = fb.grammar || [];
+  const grUsed = gr.filter((g) => g.count), grNot = gr.filter((g) => !g.count);
   const v = fb.vocab;
   const total = v ? LEVELS.reduce((n, l) => n + v.counts[l], 0) || 1 : 1;
   const bars = v ? LEVELS.map((l) => `<span class="lvchip lv-${l}" title="${l}: ${v.counts[l]} words">${l} <b>${Math.round((100 * v.counts[l]) / total)}%</b></span>`).join("") : "";
   return `<div class="wfb">
-    <div class="wfb-h">Feedback on your text${checkedAt ? ` <span class="muted">· checked ${esc(checkedAt)}</span>` : ""}</div>
-    ${fb.grammarError ? `<p class="muted">The grammar check was not available this time.</p>` : ""}
+    <div class="wfb-h">Feedback on your ${fb.speech ? "speaking" : "text"}${checkedAt ? ` <span class="muted">· checked ${esc(checkedAt)}</span>` : ""}</div>
+    ${fb.grammarError ? `<p class="muted">The grammar check was not available this time.</p>` : fb.ltError ? `<p class="muted">LanguageTool was not available this time; the text was checked by the course rules${fb.harperError ? "" : " and Harper"}.</p>` : ""}
+    ${fb.speech ? `<p class="wfb-line"><b>How you spoke:</b> ${esc(metricsLine(fb.speech))}</p><p class="wfb-line muted">The text was written by a computer from your recording. It can contain the computer’s mistakes, and it sometimes corrects a mistake you made, so listen to your recording too.</p>` : ""}
     <div class="wfb-text">${html}</div>
     ${issues ? `<ul class="wfb-issues">${issues}</ul>` : fb.grammarError ? "" : `<p class="wfb-ok">No grammar or spelling problems were found.</p>`}
     ${v ? `<div class="wfb-v"><span class="muted">${v.words} words</span> ${bars}</div>
       ${v.high.length ? `<p class="wfb-line"><b>Words at B2 and above:</b> ${v.high.map((x) => `${esc(x.w)} <small>${x.l}</small>`).join(", ")}</p>` : ""}
+      ${fb.level ? `<p class="wfb-line"><b>Vocabulary level:</b> ${esc(fb.level)} <span class="muted">(95% of the listed words are at this level or below)</span></p>` : ""}
       ${fb.unitTotal ? `<p class="wfb-line"><b>Unit phrases used (${v.unitUsed.length} of ${fb.unitTotal}):</b> ${v.unitUsed.length ? v.unitUsed.map(esc).join(", ") : "none yet"}</p>` : ""}
+      ${gr.length ? `<div class="wfb-gr"><b>Unit grammar used:</b> ${grUsed.length ? `<ul>${grUsed.map((g) => `<li>${esc(g.label)} <b>${g.count}</b>: <i>${g.examples.map(esc).join(" · ")}</i></li>`).join("")}</ul>` : " none yet"}
+        ${grNot.length ? `<p class="muted">You could also try: ${grNot.slice(0, 4).map((g) => esc(g.label.replace(/ \(.*$/, ""))).join(" · ")}</p>` : ""}</div>` : ""}
       ${v.offList.length ? `<p class="wfb-line muted">Not in the word lists (names, rare words or misspellings): ${v.offList.map(esc).join(", ")}</p>` : ""}` : ""}
-    <p class="wfb-src">Grammar suggestions by <a href="https://languagetool.org" target="_blank">LanguageTool</a> · vocabulary levels from the CEFR-J Wordlist and the Octanove Vocabulary Profile</p>
+    <p class="wfb-src">Grammar suggestions by <a href="https://languagetool.org" target="_blank">LanguageTool</a>, <a href="https://writewithharper.com" target="_blank">Harper</a> and the course rules · unit grammar found automatically (approximate) · vocabulary levels from the CEFR-J Wordlist and the Octanove Vocabulary Profile</p>
   </div>`;
 }

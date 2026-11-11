@@ -4,15 +4,15 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
   sendPasswordResetEmail, signOut, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, orderBy,
   serverTimestamp,
-} from "./fb.js?v=20261029c";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261029c";
+} from "./fb.js?v=20261111a";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261111a";
 import {
   esc, renderBlocks, readInput, fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, exercisesOf, isAuto,
   isTeacherChecked, wireFlashcards, countWords, DONE, doneMap, exerciseNumbers, planTag,
-} from "./common.js?v=20261029c";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261029c";
-import { feedbackHTML } from "./writing.js?v=20261029c";
-import "./speaking.js?v=20261029c";
+} from "./common.js?v=20261111a";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261111a";
+import { feedbackHTML } from "./writing.js?v=20261111a";
+import "./speaking.js?v=20261111a";
 
 const $ = (s) => document.querySelector(s);
 const S = {
@@ -28,7 +28,6 @@ const S = {
   unsub: [], unitUnsub: {}, resultUnsub: {},
   registering: false,
 };
-const LOCAL_NOTE = "Saved on this device. Click Done to send the exercise to your teacher.";
 const SAVE_DELAY = 1000;
 let saveTimer = null;
 
@@ -162,7 +161,8 @@ function ensureUnit(unitId) {
       const serverMs = server.updatedAt?.toMillis?.() || 0;
       if (local && local.ts > serverMs && server.status !== "submitted" && !isReleased(unitId)) {
         S.sub[unitId].answers = local.answers;
-        S.sub[unitId].dirty = true;   // restored into the fields, but sent only when the student clicks Done
+        S.sub[unitId].dirty = true;
+        scheduleSave(unitId);
       }
     } else if (!snap.metadata.hasPendingWrites) {
       // обновляем статус; ответы — только если у нас нет несохранённых правок
@@ -249,8 +249,8 @@ function renderMain() {
   }
   ensureUnit(unit.id);
   const c = S.content[unit.id], sub = S.sub[unit.id];
-  if (c === undefined || !sub) { content.dataset.view = ""; content.innerHTML = `<p class="muted">Loading…</p>`; return; }
-  if (c === null) { content.dataset.view = ""; content.innerHTML = `<div class="locked-msg">You do not have access to this unit.</div>`; return; }
+  if (c === undefined || !sub) { content.innerHTML = `<p class="muted">Loading…</p>`; return; }
+  if (c === null) { content.innerHTML = `<div class="locked-msg">You do not have access to this unit.</div>`; return; }
 
   const sec = c.sections.find((s) => s.id === r.section) || c.sections[0];
   const secIdx = c.sections.indexOf(sec) + 1;
@@ -262,16 +262,19 @@ function renderMain() {
   const relEx = S.group.releasedEx?.[unit.id] || [];
   const done = doneMap(sub.answers);
   const plan = S.group.plan?.[unit.id] || {};
-  const viewKey = `${unit.id}/${sec.id}/${readOnly}/${!!res}/${relEx.join(",")}/${(S.group.feedbackEx?.[unit.id] || []).join(",")}/${S.exrVer}/${JSON.stringify(done)}/${JSON.stringify(plan)}`;
+  const viewKey = `${unit.id}/${sec.id}/${readOnly}/${!!res}/${relEx.join(",")}/${(S.group.feedbackEx?.[unit.id] || []).join(",")}/${S.exrVer}/${stableJSON(done)}/${stableJSON(plan)}`;
 
-  // nothing on the page has changed (e.g. a draft came back from the database): only the bar is updated,
-  // so the page does not jump and the cursor stays in place
-  if (content.dataset.view === viewKey && content.dataset.unit === unit.id && !content.dataset.test) {
+  // do not re-render while the student is typing (keeps the cursor in place)
+  const active = document.activeElement;
+  if (content.dataset.view === viewKey && active?.dataset?.item && content.contains(active)) {
     renderUnitBar(unit, sub, released, res);
     return;
   }
+  // the page has to be drawn again: remember where the student is, to put them back there afterwards
+  const keep = content.dataset.unit === unit.id && content.dataset.sec === sec.id ? rememberPlace(content) : null;
   content.dataset.view = viewKey;
   content.dataset.unit = unit.id;
+  content.dataset.sec = sec.id;
   content.innerHTML = `<header class="page-h"><div class="pe">Unit ${unitNum(unit)} &middot; ${unitNum(unit)}.${secIdx}</div>
       <h2>${esc(sec.title)}</h2>${meta.subtitle || sec.subtitle ? `<p class="pl">${esc(meta.subtitle || sec.subtitle)}</p>` : ""}</header>`
     + renderBlocks(sec.blocks, (ex) => {
@@ -284,6 +287,7 @@ function renderMain() {
       return {
         itemExtra: fb ? (itemId) => feedbackHTML(fb[itemId], { checkedAt: fmtTime(fbAt) }) : null,
         answers: sub.answers?.[ex.id] || {},
+        speech: sub.answers?._speech?.[ex.id],
         readOnly: readOnly || exDone || isDone,
         headExtra: planTag(plan[ex.id]),
         factor,
@@ -296,7 +300,59 @@ function renderMain() {
       };
     }, `${unitNum(unit)}.${secIdx}`) + pagerHTML(unit, c, sec);
   renderUnitBar(unit, sub, released, res);
+  if (keep) restorePlace(content, keep);
   if (pendingScroll) { const id = pendingScroll; pendingScroll = null; setTimeout(() => scrollToEx(id), 30); }
+}
+
+// ------------------------------------------------------------------ keeping the cursor and the scroll position
+// The unit page is drawn again when something changes in the database (the teacher marks an exercise In-Class,
+// checks an exercise, a save comes back from the server). Without this the cursor left the field the student was
+// typing in, and pictures without a known height (they load again) made the page jump up.
+const stableJSON = (v) => JSON.stringify(v, (k, x) =>
+  x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((key) => [key, x[key]])) : x);
+const fieldSel = (el) => `[data-ex="${CSS.escape(el.dataset.ex)}"][data-item="${CSS.escape(el.dataset.item)}"]`
+  + (el.type === "radio" || el.type === "checkbox" ? `[value="${CSS.escape(el.value)}"]` : "");
+function rememberPlace(content) {
+  const keep = { minH: content.offsetHeight };
+  const a = document.activeElement;
+  if (a && content.contains(a) && a.dataset?.ex && a.dataset?.item) {
+    keep.focus = fieldSel(a);
+    try { keep.sel = [a.selectionStart, a.selectionEnd, a.selectionDirection]; } catch {}
+    keep.innerTop = a.scrollTop;
+    keep.anchor = keep.focus;
+    keep.top = a.getBoundingClientRect().top;
+  } else {
+    // the first exercise (or block) that can be seen on the screen
+    const ex = [...content.querySelectorAll(".ex[id], [data-ex][data-item]")].find((el) => el.getBoundingClientRect().bottom > 70);
+    if (ex) { keep.anchor = ex.id ? `#${CSS.escape(ex.id)}` : fieldSel(ex); keep.top = ex.getBoundingClientRect().top; }
+  }
+  // the page must not get shorter for a moment while the pictures load again
+  content.style.minHeight = keep.minH + "px";
+  return keep;
+}
+let minHTimer = null;
+function restorePlace(content, keep) {
+  if (keep.focus) {
+    const el = content.querySelector(keep.focus);
+    if (el && !el.disabled) {
+      el.focus({ preventScroll: true });
+      if (keep.sel && el.setSelectionRange && keep.sel[0] != null) { try { el.setSelectionRange(...keep.sel); } catch {} }
+      if (keep.innerTop) el.scrollTop = keep.innerTop;
+    }
+  }
+  const fix = () => {
+    const el = keep.anchor && content.querySelector(keep.anchor);
+    if (el) { const d = el.getBoundingClientRect().top - keep.top; if (Math.abs(d) > 1) window.scrollBy(0, d); }
+  };
+  fix();
+  // when the pictures have loaded, take the height limit away and check the position once more
+  const imgs = [...content.querySelectorAll("img")].filter((i) => !i.complete);
+  clearTimeout(minHTimer);
+  const done = () => { content.style.minHeight = ""; fix(); };
+  if (!imgs.length) { minHTimer = setTimeout(done, 50); return; }
+  let left = imgs.length;
+  imgs.forEach((i) => { i.loading = "eager"; const f = () => { if (--left === 0) { clearTimeout(minHTimer); done(); } }; i.addEventListener("load", f, { once: true }); i.addEventListener("error", f, { once: true }); });
+  minHTimer = setTimeout(done, 3000);
 }
 
 // ------------------------------------------------------------------ "Done" for each exercise
@@ -376,7 +432,7 @@ function renderUnitBar(unit, sub, released, res) {
       ? `<div class="ub ub-ret"><b>Your teacher has returned this work for revision${sub.returnedAt?.toDate ? ` (${fmtTime(sub.returnedAt)})` : ""}.</b>
          ${sub.returnNote ? `<span class="ret-note">${esc(sub.returnNote)}</span>` : ""}<span class="muted">Make your changes and submit the unit again.</span></div>` : "";
     const p = doneProgress(unit, sub);
-    html = ret + `<div class="ub"><span id="save-state" class="muted">${sub.dirty ? LOCAL_NOTE : sub.updatedAt ? "Sent to your teacher " + fmtTime(sub.updatedAt) : "Your answers are kept on this device until you click Done"}</span>
+    html = ret + `<div class="ub"><span id="save-state" class="muted">${sub.dirty ? "Unsaved changes…" : sub.updatedAt ? "Draft saved " + fmtTime(sub.updatedAt) : "Your answers are saved automatically"}</span>
       <span class="ub-done"><b>${p.done} / ${p.total}</b> exercises done</span>
       <button class="btn primary" id="submit-unit" ${p.left.length ? `disabled title="Mark every exercise as Done first"` : ""}>Submit this unit</button>
       ${p.left.length ? `<div class="ub-left">Click <b>Done</b> under each exercise when you finish it. You can submit the unit when all exercises are done. Not done yet:
@@ -405,12 +461,12 @@ function onAnswer(e) {
   sub.answers[el.dataset.ex][el.dataset.item] = v;
   sub.dirty = true;
   writeLocal(unitId, sub.answers);
-  // answers stay on this device; they go to the teacher only when the student clicks Done
-  setSaveState(LOCAL_NOTE);
-  // the "N of M answered" counter under the exercise is updated in place (no re-render)
+  setSaveState("Editing…");
+  scheduleSave(unitId);
+  // the "N of M answered" counter under the exercise is updated in place (the page is not drawn again)
   const foot = document.querySelector(`[data-foot="${CSS.escape(el.dataset.ex)}"]`);
-  const ex = foot && exercisesOf(S.content[unitId]).find((x) => x.id === el.dataset.ex);
-  if (ex) foot.textContent = `${(ex.items || []).filter((it) => String(sub.answers[ex.id]?.[it.id] ?? "").trim()).length} of ${(ex.items || []).length} answered`;
+  const fex = foot && exercisesOf(S.content[unitId]).find((x) => x.id === el.dataset.ex);
+  if (fex) foot.textContent = `${(fex.items || []).filter((it) => String(sub.answers[fex.id]?.[it.id] ?? "").trim()).length} of ${(fex.items || []).length} answered`;
 }
 
 function scheduleSave(unitId) {
@@ -454,8 +510,8 @@ async function saveDraft(unitId, status = "draft", retry = true) {
     sub.status = status;
     if (status === "submitted") sub.submittedAt = new Date();
     S.server[unitId] = structuredClone(data.answers);
-    if (sub.dirty) writeLocal(unitId, sub.answers); else clearLocal(unitId);
-    setSaveState("✓ Sent to your teacher " + fmtTime(new Date()));
+    clearLocal(unitId);
+    setSaveState("✓ Saved " + fmtTime(new Date()));
   } catch (e) {
     sub.dirty = true;
     // the teacher may have just checked an exercise: take the checked answers and try once more
@@ -471,8 +527,7 @@ async function saveDraft(unitId, status = "draft", retry = true) {
 async function flushSave() {
   clearTimeout(saveTimer);
   const unitId = $("#content").dataset.unit;
-  // only the local copy is written; answers are sent to the teacher with Done
-  if (unitId && S.sub[unitId]?.dirty) writeLocal(unitId, S.sub[unitId].answers);
+  if (unitId && S.sub[unitId]?.dirty) await saveDraft(unitId).catch(() => {});
 }
 document.addEventListener("visibilitychange", () => { if (document.hidden) flushSave(); });
 window.addEventListener("pagehide", () => flushSave());
