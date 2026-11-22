@@ -2,12 +2,13 @@
 // Octanove C1–C2, Google 10,000 frequency list as a fallback) and use of the unit's vocabulary.
 // The check runs in the teacher's browser when the teacher clicks the button; the result is
 // saved for each student in exerciseResults and shown under their text.
-import { esc } from "./common.js?v=20261111a";
-import { metricsLine } from "./transcribe.js?v=20261111a";
-import { learnerIssues, findGrammar, textLevel } from "./grammar.js?v=20261111a";
+import { esc } from "./common.js?v=20261122a";
+import { metricsLine } from "./transcribe.js?v=20261122a";
+import { learnerIssues, findGrammar, textLevel } from "./grammar.js?v=20261122a";
 
 const LT_URL = "https://api.languagetool.org/v2/check";
 const LT_LANG = "en-GB";
+const GROQ_URL = "https://api.groq.com/openai/v1";
 export const LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"];
 
 // ------------------------------------------------------------------ word lists
@@ -192,6 +193,79 @@ export async function checkGrammar(texts) {
   return { issues, ltError, harperError };
 }
 
+// ------------------------------------------------------------------ optional AI review (Groq)
+// The API key is supplied by the teacher at runtime and is never passed to this module for storage.
+// Only the response text/transcript, task and non-identifying learning context are sent to Groq.
+const GROQ_SCHEMA = {
+  name: "language_review",
+  strict: true,
+  schema: {
+    type: "object", additionalProperties: false,
+    properties: {
+      cefr: { type: "string", enum: LEVELS },
+      task_achievement: { type: "string", enum: ["limited", "developing", "effective", "strong"] },
+      summary: { type: "string" },
+      strengths: { type: "array", minItems: 1, maxItems: 3, items: { type: "string" } },
+      priorities: {
+        type: "array", minItems: 1, maxItems: 3,
+        items: {
+          type: "object", additionalProperties: false,
+          properties: { issue: { type: "string" }, advice: { type: "string" }, example: { type: "string" } },
+          required: ["issue", "advice", "example"],
+        },
+      },
+    },
+    required: ["cefr", "task_achievement", "summary", "strengths", "priorities"],
+  },
+};
+
+const cleanList = (v, n = 3) => (Array.isArray(v) ? v : []).slice(0, n).map((x) => String(x || "").trim()).filter(Boolean);
+function cleanGroqReview(v) {
+  if (!v || typeof v !== "object") throw new Error("Groq returned an invalid review.");
+  const cefr = LEVELS.includes(v.cefr) ? v.cefr : "";
+  const strengths = cleanList(v.strengths);
+  const priorities = (Array.isArray(v.priorities) ? v.priorities : []).slice(0, 3).map((x) => ({
+    issue: String(x?.issue || "").trim(), advice: String(x?.advice || "").trim(), example: String(x?.example || "").trim(),
+  })).filter((x) => x.issue || x.advice || x.example);
+  if (!cefr || !strengths.length || !priorities.length) throw new Error("Groq returned an incomplete review.");
+  return { cefr, taskAchievement: String(v.task_achievement || ""), summary: String(v.summary || "").trim(), strengths, priorities };
+}
+
+export async function groqReview({ key, model, text, task, phrases = [], localLevel = "", speech = null }) {
+  if (!key) throw new Error("Add a Groq API key in AI review settings first.");
+  const mode = speech ? "spoken response transcribed automatically" : "written response";
+  const speechContext = speech
+    ? `\nSpeech measurements (use cautiously): ${metricsLine(speech)}. Do not assess pronunciation because you cannot hear the audio.` : "";
+  const prompt = `Mode: ${mode}\nTask: ${task || "Respond to the course task."}\nAutomated lexical level: ${localLevel || "not available"}`
+    + `\nTarget unit vocabulary: ${phrases.slice(0, 40).join("; ") || "not supplied"}${speechContext}\n\nLearner response:\n${text}`;
+  const r = await fetch(`${GROQ_URL}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: model || "openai/gpt-oss-20b",
+      temperature: 0.1,
+      max_completion_tokens: 700,
+      messages: [
+        { role: "system", content: "You are a careful CEFR English teacher. Evaluate only the learner response supplied. Be supportive, specific and concise. Judge task achievement, organisation, grammar and vocabulary. Do not invent errors or rewrite the whole response. For a speech transcript, remember that transcription may contain recognition errors and do not claim to assess pronunciation. Return only the required JSON." },
+        { role: "user", content: prompt },
+      ],
+      response_format: { type: "json_schema", json_schema: GROQ_SCHEMA },
+    }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error?.message || `Groq answered ${r.status}`);
+  const raw = data?.choices?.[0]?.message?.content;
+  if (!raw) throw new Error("Groq returned no review.");
+  return cleanGroqReview(JSON.parse(raw));
+}
+
+export async function testGroqKey(key) {
+  const r = await fetch(`${GROQ_URL}/models`, { headers: { Authorization: `Bearer ${key}` } });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error?.message || `Groq answered ${r.status}`);
+  return Array.isArray(data.data) ? data.data.length : 0;
+}
+
 // The unit's grammar structures used in a text, and the vocabulary level that covers 95% of its words
 export { findGrammar, textLevel };
 
@@ -217,6 +291,14 @@ export function feedbackHTML(fb, { checkedAt } = {}) {
   const v = fb.vocab;
   const total = v ? LEVELS.reduce((n, l) => n + v.counts[l], 0) || 1 : 1;
   const bars = v ? LEVELS.map((l) => `<span class="lvchip lv-${l}" title="${l}: ${v.counts[l]} words">${l} <b>${Math.round((100 * v.counts[l]) / total)}%</b></span>`).join("") : "";
+  const ai = fb.ai;
+  const aiHTML = ai ? `<div class="ai-review">
+    <div class="ai-review-h"><b>Optional AI review</b><span class="pill">Groq · estimated ${esc(ai.cefr)}</span></div>
+    <p>${esc(ai.summary)}</p>
+    <p><b>Strengths</b></p><ul>${(ai.strengths || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+    <p><b>Priorities for the next version</b></p><ol>${(ai.priorities || []).map((x) => `<li><b>${esc(x.issue)}</b> – ${esc(x.advice)}${x.example ? `<br><span class="muted">Example: ${esc(x.example)}</span>` : ""}</li>`).join("")}</ol>
+    <p class="muted">AI feedback can be wrong. Compare it with the LanguageTool, Harper and CEFR evidence above${fb.speech ? "; pronunciation is not assessed from a transcript" : ""}.</p>
+  </div>` : "";
   return `<div class="wfb">
     <div class="wfb-h">Feedback on your ${fb.speech ? "speaking" : "text"}${checkedAt ? ` <span class="muted">· checked ${esc(checkedAt)}</span>` : ""}</div>
     ${fb.grammarError ? `<p class="muted">The grammar check was not available this time.</p>` : fb.ltError ? `<p class="muted">LanguageTool was not available this time; the text was checked by the course rules${fb.harperError ? "" : " and Harper"}.</p>` : ""}
@@ -230,6 +312,7 @@ export function feedbackHTML(fb, { checkedAt } = {}) {
       ${gr.length ? `<div class="wfb-gr"><b>Unit grammar used:</b> ${grUsed.length ? `<ul>${grUsed.map((g) => `<li>${esc(g.label)} <b>${g.count}</b>: <i>${g.examples.map(esc).join(" · ")}</i></li>`).join("")}</ul>` : " none yet"}
         ${grNot.length ? `<p class="muted">You could also try: ${grNot.slice(0, 4).map((g) => esc(g.label.replace(/ \(.*$/, ""))).join(" · ")}</p>` : ""}</div>` : ""}
       ${v.offList.length ? `<p class="wfb-line muted">Not in the word lists (names, rare words or misspellings): ${v.offList.map(esc).join(", ")}</p>` : ""}` : ""}
+    ${aiHTML}
     <p class="wfb-src">Grammar suggestions by <a href="https://languagetool.org" target="_blank">LanguageTool</a>, <a href="https://writewithharper.com" target="_blank">Harper</a> and the course rules · unit grammar found automatically (approximate) · vocabulary levels from the CEFR-J Wordlist and the Octanove Vocabulary Profile</p>
   </div>`;
 }

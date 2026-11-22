@@ -1,7 +1,7 @@
 // Measures of students' speaking (Whisper transcripts) and writing, for the Progress page of the Teacher's Edition
 // and for the CSV export used in research. Everything is computed in the teacher's browser.
-import { tokens, lemma, vocabProfile } from "./writing.js?v=20261111a";
-import { findGrammar, textLevel } from "./grammar.js?v=20261111a";
+import { tokens, lemma, vocabProfile } from "./writing.js?v=20261122a";
+import { findGrammar, textLevel } from "./grammar.js?v=20261122a";
 
 // Writing that is followed over time: open exercises marked "track": "writing" in the course file,
 // or one-text exercises in a Writing section / with a letter, essay, report, review or article to write.

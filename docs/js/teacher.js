@@ -4,17 +4,17 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
   doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, orderBy,
   writeBatch, arrayUnion, arrayRemove, serverTimestamp, deleteField,
-} from "./fb.js?v=20261111a";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261111a";
+} from "./fb.js?v=20261122a";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261122a";
 import {
   esc, renderBlocks, renderExercise, exercisesOf, isAuto, gradeAuto, buildResult, keyText, norm,
   fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, KIND_LABEL, isTeacherChecked, gradeExercise, wireFlashcards, isManual,
   isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2,
-} from "./common.js?v=20261111a";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261111a";
-import { loadVocab, checkGrammar, vocabProfile, unitVocabulary, feedbackHTML, sleep, findGrammar, textLevel } from "./writing.js?v=20261111a";
-import "./speaking.js?v=20261111a";
-import { isWritingTask, measure, METRICS, toCSV } from "./progress.js?v=20261111a";
+} from "./common.js?v=20261122a";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261122a";
+import { loadVocab, checkGrammar, vocabProfile, unitVocabulary, feedbackHTML, sleep, findGrammar, textLevel, groqReview, testGroqKey } from "./writing.js?v=20261122a";
+import "./speaking.js?v=20261122a";
+import { isWritingTask, measure, METRICS, toCSV } from "./progress.js?v=20261122a";
 
 const $ = (s) => document.querySelector(s);
 const ls = {
@@ -39,6 +39,7 @@ const T = {
   viewAs: "",            // unit page: "" = the teacher's own practice answers, or a student uid whose answers are shown
   statsOnlySubmitted: false,
   journal: undefined,    // attendance of the current group: {lessons: {"2026-10-21": {absent: [uid]}}}
+  groq: { key: "", enabled: false, model: ls.get("groqModel", "openai/gpt-oss-20b") }, // key stays in memory only
   unitViewKey: "",
 };
 // An absent student gets this share of the points for the in-class exercises of that lesson
@@ -53,6 +54,7 @@ const TOOLS = [
   { id: "speaking", icon: "🎙", title: "Speaking progress", sub: "Recordings as text: figures, trends, texts" },
   { id: "writing", icon: "✍", title: "Writing progress", sub: "Letters and essays: figures, trends, texts" },
   { id: "groups", icon: "👥", title: "Groups & students", sub: "Group codes, moving and removing students" },
+  { id: "ai", icon: "✦", title: "AI review", sub: "Optional Groq feedback for writing and speaking" },
   { id: "content", icon: "📦", title: "Course content", sub: "Import units and keys" },
 ];
 
@@ -88,7 +90,7 @@ onAuthStateChanged(auth, async (user) => {
   $("#boot").hidden = true;
   $("#auth-screen").hidden = !!user;
   $("#app").hidden = true; $("#denied").hidden = true;
-  if (!user) return;
+  if (!user) { T.groq.key = ""; T.groq.enabled = false; return; }
   const t = await getDoc(doc(db, "teachers", user.uid)).catch(() => null);
   if (!t?.exists()) { $("#denied").hidden = false; return; }
   $("#app").hidden = false;
@@ -233,19 +235,52 @@ function render(force = false) {
   }
   // do not re-render while the teacher is typing a mark, comment or JSON
   const a = document.activeElement;
-  if (!force && a && $("#view").contains(a) && a.matches(".g-score,.g-comment,textarea.json,input[type=text],input:not([type]),[data-item],input[type=date]")) return;
+  if (!force && a && $("#view").contains(a) && a.matches(".g-score,.g-comment,textarea.json,input[type=text],input[type=password],input:not([type]),[data-item],input[type=date]")) return;
   if (r.unit && r.unit !== T.unitId && T.units.some((u) => u.id === r.unit)) { setUnit(r.unit); return; }
   $("#wrap").classList.toggle("wide", !!r.tool && r.tool !== "content");
   T.unitViewKey = "";
   if (r.unit) { $("#view").innerHTML = viewUnit(r); T.unitViewKey = unitViewKey(r); return; }
   const tool = TOOLS.find((t) => t.id === r.tool);
   $("#crumb").innerHTML = `<b>Teaching tools</b> &middot; ${tool.title}`;
-  const views = { access: viewAccess, works: viewWorks, tests: viewTests, stats: viewStats, content: viewContent, groups: viewGroups, journal: viewJournal, speaking: () => viewProgress("speaking"), writing: () => viewProgress("writing") };
+  const views = { access: viewAccess, works: viewWorks, tests: viewTests, stats: viewStats, content: viewContent, groups: viewGroups, ai: viewAI, journal: viewJournal, speaking: () => viewProgress("speaking"), writing: () => viewProgress("writing") };
   $("#view").innerHTML = views[r.tool]();
 }
 
 const pageHead = (eyebrow, title, lead = "") =>
   `<header class="page-h"><div class="pe">${eyebrow}</div><h2>${title}</h2>${lead ? `<p class="pl">${lead}</p>` : ""}</header>`;
+
+// ================================================================== Optional Groq review
+// The key is deliberately kept only in the JavaScript state of this tab: never localStorage, Firestore or course JSON.
+function viewAI() {
+  const ready = !!T.groq.key;
+  return pageHead("Teaching tools", "AI review", "Optional second opinion for writing and transcribed speaking.") + `
+    <div class="box">
+      <h3 style="margin-top:0">Groq for this tab</h3>
+      <p>LanguageTool, Harper, the course rules and the CEFR vocabulary profile always run as before. If Groq is enabled, the learner's text or speech transcript is also sent to Groq when you click <b>Check writing</b> or <b>Check speaking</b>.</p>
+      <div class="ai-key-status"><span class="pill ${ready ? "on" : "off"}">${ready ? "key ready" : "no key"}</span>
+        ${ready ? `<label><input type="checkbox" id="groq-enabled" ${T.groq.enabled ? "checked" : ""}> Use Groq in the next checks</label>` : ""}</div>
+      <label class="ai-field">Groq API key
+        <input type="password" id="groq-key" autocomplete="off" spellcheck="false" placeholder="gsk_…" value="">
+      </label>
+      <label class="ai-field">Model
+        <input type="text" id="groq-model" autocomplete="off" spellcheck="false" value="${esc(T.groq.model)}">
+      </label>
+      <div class="row">
+        <button class="btn primary" data-act="groq-save">Use key in this tab</button>
+        ${ready ? `<button class="btn" data-act="groq-test">Test connection</button><button class="btn danger" data-act="groq-clear">Forget key</button>` : ""}
+      </div>
+      <p class="muted"><b>The key is not saved:</b> it stays only in memory until this page is reloaded or closed. It is never written to Firebase, the course file, local storage or GitHub.</p>
+      <p class="muted"><b>Privacy:</b> Groq receives the response text or the Whisper transcript, the task and learning context. Student names and audio recordings are not sent. AI feedback is saved with the ordinary feedback and shown to the student. Groq recommends a trusted backend proxy for production use; direct browser entry is provided here only as an optional teacher-controlled mode.</p>
+    </div>`;
+}
+
+async function testCurrentGroq() {
+  if (!T.groq.key) return toast("Add the Groq key first.");
+  await guard(async () => {
+    const n = await testGroqKey(T.groq.key);
+    toast(`Groq connection works${n ? ` · ${n} models available` : ""}.`, 5000);
+  });
+}
 
 // ================================================================== Unit with keys
 function viewUnit(r) {
@@ -361,7 +396,7 @@ async function downloadDocx(unitId, ver, btn) {
   try {
     const d = await loadUnitData(unitId);
     if (!d?.content) throw new Error("This unit has no content yet.");
-    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261111a");
+    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261122a");
     const teacher = ver === "teacher";
     const sections = d.content.sections.map((s) => ({ ...s, subtitle: (u.sections || []).find((m) => m.id === s.id)?.subtitle || s.subtitle || "" }));
     const blob = await exportUnitDocx({ courseTitle: COURSE_TITLE, unitNum: unitNum(u), unitTitle: u.title, sections,
@@ -624,10 +659,13 @@ async function checkExercise(gid, unitId, exId) {
 // Free writing ("kind": "open", "check": "teacher"): the check gives feedback, the text stays editable
 function writingBar(u, ex, g) {
   const done = (g.feedbackEx?.[u.id] || []).includes(ex.id);
+  const speaking = !!ex.transcript || (ex.items || []).some((it) => it.speak);
+  const ai = T.groq.enabled && T.groq.key;
   return `<div class="tb-row"><span>Group <b>${esc(g.name)}</b>: <span class="pill ${done ? "on" : "off"}">${done ? "feedback shown" : "not checked yet"}</span></span>
+    <a href="#tools/ai" class="pill ${ai ? "on" : "off"}">Groq ${ai ? "on" : "off"}</a>
     <span class="sp" style="flex:1"></span>
     <span id="wcheck-progress" class="muted"></span>
-    <button class="btn small good" data-act="check-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}" ${g.openUnits.includes(u.id) ? "" : "disabled"}>${done ? "Check again" : "Check the writing now"}</button>
+    <button class="btn small good" data-act="check-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}" ${g.openUnits.includes(u.id) ? "" : "disabled"}>${done ? "Check again" : `Check the ${speaking ? "speaking" : "writing"} now`}</button>
     ${done ? `<button class="btn small danger" data-act="hide-writing" data-unit="${esc(u.id)}" data-ex="${esc(ex.id)}">Hide feedback</button>` : ""}
   </div>`;
 }
@@ -643,11 +681,13 @@ async function checkWriting(gid, unitId, exId) {
     const ex = exercisesOf(content).find((e) => e.id === exId);
     const subs = (await getDocs(query(collection(db, "submissions"), where("groupId", "==", gid), where("unitId", "==", unitId)))).docs.map((d) => d.data())
       .filter((s) => Object.values(s.answers?.[exId] || {}).some((v) => String(v).trim()));
-    if (!confirm(`Check the writing in “${ex.title}”?\nStudents with answers: ${subs.length}.\nThe texts are sent to LanguageTool for the grammar check (about 3 seconds per student) and checked on this computer by Harper and the course rules. Students will see the feedback and can correct their texts.`)) return;
+    const useGroq = !!(T.groq.enabled && T.groq.key);
+    const speakingTask = !!ex.transcript || (ex.items || []).some((it) => it.speak);
+    if (!confirm(`Check the ${speakingTask ? "speaking" : "writing"} in “${ex.title}”?\nStudents with answers: ${subs.length}.\nThe texts are sent to LanguageTool for the grammar check (about 3 seconds per student) and checked on this computer by Harper and the course rules.${useGroq ? " The response text or speech transcript will also be sent to Groq for optional AI feedback; names and audio are not sent." : ""}\nStudents will see the feedback and can correct their responses.`)) return;
     const V = await loadVocab();
     const phrases = unitVocabulary(content);
     const gIds = unitGrammar(content, ex);
-    let n = 0, ltFailed = 0;
+    let n = 0, ltFailed = 0, groqFailed = 0;
     for (const s of subs) {
       n++;
       const prog = document.querySelector("#wcheck-progress");
@@ -667,6 +707,13 @@ async function checkWriting(gid, unitId, exId) {
           level: textLevel(vocab.counts), grammar: findGrammar(text, gIds) };
         // a transcribed speaking task: the measurements of the speech (length, speed, pauses) go with the feedback
         if (ex.transcript && it === ex.items[0] && s.answers?._speech?.[exId]) { try { fb[it.id].speech = JSON.parse(s.answers._speech[exId]); } catch {} }
+        if (useGroq) {
+          try {
+            const task = String(it.text || ex.rubric || ex.title || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+            fb[it.id].ai = await groqReview({ key: T.groq.key, model: T.groq.model, text, task, phrases,
+              localLevel: fb[it.id].level, speech: fb[it.id].speech || null });
+          } catch (e) { console.warn("Groq", e); groqFailed++; }
+        }
       }
       await setDoc(doc(db, "exerciseResults", subId(unitId, s.uid)), {
         uid: s.uid, groupId: gid, unitId,
@@ -675,7 +722,10 @@ async function checkWriting(gid, unitId, exId) {
       if (n < subs.length && !ltError) await sleep(3200);   // LanguageTool: at most 20 requests a minute
     }
     await updateDoc(doc(db, "groups", gid), { [`feedbackEx.${unitId}`]: arrayUnion(exId) });
-    toast(ltFailed ? `Done. LanguageTool was not available for ${ltFailed} of ${subs.length}; Harper, the course rules and the vocabulary check worked.` : `Done: ${subs.length} texts checked. Students can see the feedback now.`, 7000);
+    const notes = [];
+    if (ltFailed) notes.push(`LanguageTool was unavailable for ${ltFailed} of ${subs.length}`);
+    if (groqFailed) notes.push(`Groq feedback failed for ${groqFailed} response${groqFailed === 1 ? "" : "s"}`);
+    toast(notes.length ? `Done. ${notes.join("; ")}. The other checks worked.` : `Done: ${subs.length} texts checked. Students can see the feedback now.`, 7000);
   });
 }
 
@@ -1009,6 +1059,8 @@ function viewAccess() {
 
 document.addEventListener("change", (e) => {
   if (e.target.id === "show-correct") { T.showCorrect = e.target.checked; ls.set("showCorrect", T.showCorrect ? "1" : "0"); }
+  if (e.target.id === "groq-enabled") { T.groq.enabled = e.target.checked && !!T.groq.key; }
+  if (e.target.id === "groq-model") { T.groq.model = e.target.value.trim() || "openai/gpt-oss-20b"; ls.set("groqModel", T.groq.model); }
   if (e.target.id === "stats-submitted") { T.statsOnlySubmitted = e.target.checked; render(true); }
   if (e.target.id === "g-filter") { T.groupFilter = e.target.value; render(true); }
   if (e.target.matches("select[data-move]")) guard(async () => {
@@ -1028,6 +1080,15 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   const act = b.dataset.act, u = b.dataset.unit;
   const handlers = {
+    "groq-save": () => {
+      const key = $("#groq-key")?.value.trim() || "";
+      const model = $("#groq-model")?.value.trim() || "openai/gpt-oss-20b";
+      if (!key) return toast("Paste the Groq API key first.");
+      T.groq.key = key; T.groq.enabled = true; T.groq.model = model; ls.set("groqModel", model);
+      render(true); toast("Groq is ready for this tab. The key was not saved.", 5000);
+    },
+    "groq-clear": () => { T.groq.key = ""; T.groq.enabled = false; render(true); toast("The Groq key has been forgotten."); },
+    "groq-test": () => testCurrentGroq(),
     "toggle-open": () => guard(async () => {
       const open = group().openUnits.includes(u);
       await updateDoc(doc(db, "groups", T.gid), { openUnits: open ? arrayRemove(u) : arrayUnion(u) });

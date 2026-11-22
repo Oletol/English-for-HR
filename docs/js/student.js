@@ -4,15 +4,15 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
   sendPasswordResetEmail, signOut, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, orderBy,
   serverTimestamp,
-} from "./fb.js?v=20261111a";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261111a";
+} from "./fb.js?v=20261122a";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261122a";
 import {
   esc, renderBlocks, readInput, fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, exercisesOf, isAuto,
   isTeacherChecked, wireFlashcards, countWords, DONE, doneMap, exerciseNumbers, planTag,
-} from "./common.js?v=20261111a";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261111a";
-import { feedbackHTML } from "./writing.js?v=20261111a";
-import "./speaking.js?v=20261111a";
+} from "./common.js?v=20261122a";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261122a";
+import { feedbackHTML } from "./writing.js?v=20261122a";
+import "./speaking.js?v=20261122a";
 
 const $ = (s) => document.querySelector(s);
 const S = {
