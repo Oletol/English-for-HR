@@ -17,6 +17,10 @@ const exercises = section.blocks.filter((b) => b.type === "exercise");
 assert.deepEqual(exercises.map((e) => e.id), ["v1", "v2", "v3", "v4", "v5", "v6", "v8", "v7"]);
 assert.equal(new Set(exercises.flatMap((e) => e.items.map((it) => `${e.id}/${it.id}`))).size,
   exercises.reduce((n, e) => n + e.items.length, 0));
+for (const ex of exercises) for (const item of ex.items) {
+  assert.ok((String(item.text || "").match(/___/g) || []).length <= 1,
+    `${ex.id}/${item.id} has no duplicate answer blank`);
+}
 for (const ex of exercises.filter((e) => e.kind !== "open" && e.graded !== false)) {
   assert.equal(ex.check, "teacher", `${ex.id} uses the project check flow`);
   for (const item of ex.items) assert.ok(item.answer, `${ex.id}/${item.id} has an answer`);
@@ -33,6 +37,10 @@ const grammar = unit.sections.find((s) => s.id === "grammar");
 assert.equal(grammar.title, "Grammar in Use");
 const grammarExercises = grammar.blocks.filter((b) => b.type === "exercise");
 assert.deepEqual(grammarExercises.map((e) => e.id), ["g1", "g2", "g3", "g4", "g5", "g6", "g7"]);
+for (const ex of grammarExercises) for (const item of ex.items) {
+  assert.ok((String(item.text || "").match(/___/g) || []).length <= 1,
+    `${ex.id}/${item.id} has no duplicate answer blank`);
+}
 for (const ex of grammarExercises) {
   const at = grammar.blocks.indexOf(ex);
   const discussion = grammar.blocks.slice(at + 1).find((block) => block.type !== "teacher-note");
