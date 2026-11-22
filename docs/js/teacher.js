@@ -4,17 +4,17 @@ import {
   auth, db, onAuthStateChanged, signInWithEmailAndPassword, sendPasswordResetEmail, signOut,
   doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, orderBy,
   writeBatch, arrayUnion, arrayRemove, serverTimestamp, deleteField,
-} from "./fb.js?v=20261122a";
-import { COURSE_TITLE } from "./firebase-config.js?v=20261122a";
+} from "./fb.js?v=20261122b";
+import { COURSE_TITLE } from "./firebase-config.js?v=20261122b";
 import {
   esc, renderBlocks, renderExercise, exercisesOf, isAuto, gradeAuto, buildResult, keyText, norm,
   fmtTime, friendlyError, authFormHTML, wireAuthForm, subId, KIND_LABEL, isTeacherChecked, gradeExercise, wireFlashcards, isManual,
   isCorrect, readInput, doneMap, isTranslation, exerciseNumbers, fmtDate, todayISO, answerLabel, r2,
-} from "./common.js?v=20261122a";
-import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261122a";
-import { loadVocab, checkGrammar, vocabProfile, unitVocabulary, feedbackHTML, sleep, findGrammar, textLevel, groqReview, testGroqKey } from "./writing.js?v=20261122a";
-import "./speaking.js?v=20261122a";
-import { isWritingTask, measure, METRICS, toCSV } from "./progress.js?v=20261122a";
+} from "./common.js?v=20261122b";
+import { initShell, renderUnitNav, wireUnitNav } from "./shell.js?v=20261122b";
+import { loadVocab, checkGrammar, vocabProfile, unitVocabulary, feedbackHTML, sleep, findGrammar, textLevel, groqReview, testGroqKey } from "./writing.js?v=20261122b";
+import "./speaking.js?v=20261122b";
+import { isWritingTask, measure, METRICS, toCSV } from "./progress.js?v=20261122b";
 
 const $ = (s) => document.querySelector(s);
 const ls = {
@@ -396,7 +396,7 @@ async function downloadDocx(unitId, ver, btn) {
   try {
     const d = await loadUnitData(unitId);
     if (!d?.content) throw new Error("This unit has no content yet.");
-    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261122a");
+    const { exportUnitDocx, saveBlob } = await import("./export-docx.js?v=20261122b");
     const teacher = ver === "teacher";
     const sections = d.content.sections.map((s) => ({ ...s, subtitle: (u.sections || []).find((m) => m.id === s.id)?.subtitle || s.subtitle || "" }));
     const blob = await exportUnitDocx({ courseTitle: COURSE_TITLE, unitNum: unitNum(u), unitTitle: u.title, sections,

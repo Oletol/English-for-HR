@@ -17,7 +17,7 @@ const exercises = section.blocks.filter((b) => b.type === "exercise");
 assert.deepEqual(exercises.map((e) => e.id), ["v1", "v2", "v3", "v4", "v5", "v6", "v8", "v7"]);
 assert.equal(new Set(exercises.flatMap((e) => e.items.map((it) => `${e.id}/${it.id}`))).size,
   exercises.reduce((n, e) => n + e.items.length, 0));
-for (const ex of exercises.filter((e) => e.kind !== "open")) {
+for (const ex of exercises.filter((e) => e.kind !== "open" && e.graded !== false)) {
   assert.equal(ex.check, "teacher", `${ex.id} uses the project check flow`);
   for (const item of ex.items) assert.ok(item.answer, `${ex.id}/${item.id} has an answer`);
 }
@@ -39,6 +39,9 @@ for (const ex of grammarExercises) {
   assert.ok(discussion?.html?.includes('class="discuss"'), `${ex.id} is followed by discussion`);
   assert.equal((discussion.html.match(/<li>/g) || []).length, 3, `${ex.id} has three discussion questions`);
 }
+assert.equal(grammar.blocks.filter((b) => b.type === "html" && b.html.includes('class="rule rule-fold"')).length, 3);
+for (const id of ["v8"]) assert.equal(exercises.find((e) => e.id === id).graded, false);
+assert.equal(grammarExercises.find((e) => e.id === "g6").graded, false);
 
 const browserPaths = [
   process.env.CHROME_PATH,
@@ -126,6 +129,11 @@ await student.waitForSelector("#ex-g7");
 assert.equal(await student.locator("#content .ex").count(), 7);
 assert.equal(await student.locator("#content .discuss").count(), 7);
 assert.match(await student.textContent("#content"), /All tenses: present, past and future/);
+assert.equal(await student.locator("#content details.rule-fold").count(), 3);
+assert.equal(await student.locator("#content details.rule-fold[open]").count(), 0);
+await student.locator("#content details.rule-fold summary").first().click();
+assert.equal(await student.locator("#content details.rule-fold[open]").count(), 1);
+assert.equal(await student.locator('#ex-g6 .ex-score').count(), 0);
 await student.click('.sb-item[href$="u1/vocabulary"]');
 
 const answer = (exId, itemId) => {

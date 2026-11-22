@@ -408,6 +408,14 @@ body.teacher .rule .rule-tag{background:var(--plum)}
 .rule table.g{margin:6px 0 12px;font-size:14.4px;background:#fff}
 .rule table.g th{background:#eef4fb;color:var(--navy)}
 .rule table.g td{background:#fff}
+.rule-fold{padding:0;overflow:hidden}
+.rule-fold summary{display:flex;align-items:center;gap:11px;padding:13px 16px;cursor:pointer;list-style:none;color:var(--navy);background:linear-gradient(180deg,#fbfcfe,#f5f8fb)}
+.rule-fold summary::-webkit-details-marker{display:none}
+.rule-fold summary::after{content:"+";margin-left:auto;font-size:22px;font-weight:500;color:var(--gold)}
+.rule-fold[open] summary::after{content:"−"}
+.rule-fold summary small{display:block;margin-top:2px;color:var(--mut);font-size:12px;font-weight:400}
+.rule-fold[open] summary{border-bottom:1px solid var(--line2)}
+.rule-fold .rule-b{padding:13px 16px}
 @media (max-width:640px){.rule table.g{display:block;overflow-x:auto}}
 /* short recordings inside an exercise */
 .items li.has-play{display:flex;gap:12px;align-items:center;margin-bottom:12px}

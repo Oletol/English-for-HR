@@ -150,12 +150,12 @@ await s.fill(sel("w9", "2"), "report to");
 await s.click('[data-done="w8"]');
 await s.click('[data-done="w9"]');
 await t.waitForFunction(() => /^Done$/.test(document.querySelector("#ex-w9 .sp-pill")?.textContent || ""), null, { timeout: 5000 });
-for (const [id, expect] of [["w8", "1 / 8"], ["w9", "1 / 8"]]) {
-  await t.click(`[data-act="check-ex"][data-ex="${id}"]`);
-  await s.waitForSelector(`#ex-${id} .ex-score`, { timeout: 5000 });
-  assert.equal((await s.textContent(`#ex-${id} .ex-score`)).trim(), expect, id);
+for (const id of ["w8", "w9"]) {
+  assert.equal(await t.locator(`[data-act="check-ex"][data-ex="${id}"]`).count(), 0, `${id}: translation is not auto-checked`);
+  assert.equal(await s.locator(`#ex-${id} .ex-score`).count(), 0, `${id}: no automatic score`);
   await s.locator(`#ex-${id}`).screenshot({ path: `${SHOTS}/c-${id}.png` });
 }
+assert.match(await t.textContent("#view"), /Example answers:/, "translation examples are visible to the teacher");
 
 step("Reading");
 await s.click('.sb-item[href$="u1/reading"]');
